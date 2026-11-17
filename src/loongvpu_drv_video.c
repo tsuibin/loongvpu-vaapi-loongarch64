@@ -25,10 +25,32 @@
 #include <va/va_backend.h>
 
 #include "loongvpu_abi.h"
+#include "vpu_buffer.h"
+#include "vcmd.h"
 
 #define LOONGVPU_DRIVER_NAME   "LoongVPU (open-source scaffold)"
 #define LOONGVPU_VENDOR        "loongvpu-vaapi"
 #define LOONGVPU_RENDER_NODE   "/dev/dri/renderD128"
+
+#define MAX_SURFACES 64
+#define MAX_BUFFERS  64
+#define VCMD_CMD_WORDS 256
+
+/* One tracked VA surface: maps a VASurfaceID to its VPU buffer. */
+struct tracked_surface {
+	VASurfaceID       id;
+	struct vpu_buffer *buf;
+	int               in_use;
+};
+
+/* One tracked VA buffer (slice data / params). */
+struct tracked_buffer {
+	VABufferID id;
+	VABufferType type;
+	void       *data;
+	size_t      size;
+	int         in_use;
+};
 
 /* Driver-private data, reachable via ctx->pDriverData. */
 struct loongvpu_driver_data {
@@ -37,6 +59,12 @@ struct loongvpu_driver_data {
 	int            pm_supported;    /* result of GET_PMSUP */
 	unsigned int   asic_id;
 	char           render_node[64];
+
+	struct vpu_vcmd      *vcmd;                   /* VCMD submission ctx */
+	struct tracked_surface surfaces[MAX_SURFACES];
+	struct tracked_buffer  buffers[MAX_BUFFERS];
+	VASurfaceID            current_target;       /* from vaBeginPicture */
+	uint32_t               cmd[VCMD_CMD_WORDS];  /* scratch command buffer */
 };
 
 /* ------------------------------------------------------------------------- */
@@ -71,10 +99,43 @@ static void loongvpu_drm_init(struct loongvpu_driver_data *drv)
 		drv->pm_supported = (int)sup;
 
 	drv->drm_fd = fd;
+
+	/* Open the VCMD command-buffer pool (soft-fail if unsupported). */
+	drv->vcmd = vpu_vcmd_open(fd);
+	if (drv->vcmd)
+		fprintf(stderr, "loongvpu: VCMD pool ready\n");
+	else
+		fprintf(stderr, "loongvpu: VCMD pool unavailable (decode disabled)\n");
 }
 
 static void loongvpu_drm_fini(struct loongvpu_driver_data *drv)
 {
+	int i;
+
+	if (!drv)
+		return;
+
+	/* Free all tracked surfaces (unmap + munmap + GEM close). */
+	for (i = 0; i < MAX_SURFACES; i++) {
+		if (drv->surfaces[i].in_use) {
+			vpu_buffer_free(drv->surfaces[i].buf);
+			drv->surfaces[i].in_use = 0;
+		}
+	}
+
+	/* Free all tracked VA buffers. */
+	for (i = 0; i < MAX_BUFFERS; i++) {
+		if (drv->buffers[i].in_use) {
+			free(drv->buffers[i].data);
+			drv->buffers[i].in_use = 0;
+		}
+	}
+
+	if (drv->vcmd) {
+		vpu_vcmd_close(drv->vcmd);
+		drv->vcmd = NULL;
+	}
+
 	if (drv->drm_fd >= 0) {
 		close(drv->drm_fd);
 		drv->drm_fd = -1;
@@ -243,21 +304,73 @@ static VAStatus loongvpu_QueryConfigAttributes(
 	return VA_STATUS_SUCCESS;
 }
 
+/* Find a tracked surface by id; NULL if not found. */
+static struct tracked_surface *find_surface(struct loongvpu_driver_data *drv,
+                                            VASurfaceID id)
+{
+	int i;
+	for (i = 0; i < MAX_SURFACES; i++)
+		if (drv->surfaces[i].in_use && drv->surfaces[i].id == id)
+			return &drv->surfaces[i];
+	return NULL;
+}
+
+/* Find a tracked buffer by id; NULL if not found. */
+static struct tracked_buffer *find_buffer(struct loongvpu_driver_data *drv,
+                                          VABufferID id)
+{
+	int i;
+	for (i = 0; i < MAX_BUFFERS; i++)
+		if (drv->buffers[i].in_use && drv->buffers[i].id == id)
+			return &drv->buffers[i];
+	return NULL;
+}
+
 static VAStatus loongvpu_CreateSurfaces(
 	VADriverContextP ctx, int width, int height, int format,
 	int num_surfaces, VASurfaceID *surfaces)
 {
 	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
-	int i;
+	int i, created = 0;
 
 	if (!surfaces || num_surfaces <= 0 || !drv)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
-	(void)width; (void)height; (void)format;
+	(void)format;
 
-	/* Skeleton: hand out placeholder IDs.  Real implementation must
-	 * allocate DMA-BUFs and map them into the VPU via MMU ioctls. */
-	for (i = 0; i < num_surfaces; i++)
-		surfaces[i] = (VASurfaceID)next_id(drv);
+	/* Allocate a GEM dumb buffer per surface and map it into the VPU MMU.
+	 * YUV420 needs 1.5 bytes/pixel; we request bpp=8 and 1.5x height to
+	 * keep it simple (the GEM allocator just needs a byte size). */
+	for (i = 0; i < MAX_SURFACES && created < num_surfaces; i++) {
+		struct vpu_buffer *buf;
+		int id;
+
+		if (drv->surfaces[i].in_use)
+			continue;
+
+		buf = vpu_buffer_alloc(drv->drm_fd, (size_t)width,
+		                       (size_t)((height * 3) / 2), 8);
+		if (!buf) {
+			fprintf(stderr, "loongvpu: surface alloc failed at %dx%d\n",
+			        width, height);
+			break;
+		}
+		if (vpu_buffer_mmu_map(buf, 0) < 0) {
+			fprintf(stderr, "loongvpu: surface MMU map failed\n");
+			vpu_buffer_free(buf);
+			break;
+		}
+
+		id = next_id(drv);
+		drv->surfaces[i].id     = (VASurfaceID)id;
+		drv->surfaces[i].buf    = buf;
+		drv->surfaces[i].in_use = 1;
+		surfaces[created++]     = (VASurfaceID)id;
+	}
+
+	if (created < num_surfaces)
+		/* VA has no partial-count return; report success for what we
+		 * managed to create, or failure if none. */
+		return created ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_ALLOCATION_FAILED;
 
 	return VA_STATUS_SUCCESS;
 }
@@ -265,7 +378,19 @@ static VAStatus loongvpu_CreateSurfaces(
 static VAStatus loongvpu_DestroySurfaces(
 	VADriverContextP ctx, VASurfaceID *surface_list, int num_surfaces)
 {
-	(void)ctx; (void)surface_list; (void)num_surfaces;
+	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+	int j;
+
+	if (!drv || !surface_list)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+	for (j = 0; j < num_surfaces; j++) {
+		struct tracked_surface *s = find_surface(drv, surface_list[j]);
+		if (s) {
+			vpu_buffer_free(s->buf);
+			s->in_use = 0;
+		}
+	}
 	return VA_STATUS_SUCCESS;
 }
 
@@ -298,21 +423,44 @@ static VAStatus loongvpu_CreateBuffer(
 	VABufferID *buf_id)
 {
 	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+	struct tracked_buffer *b = NULL;
+	size_t total = (size_t)size * (num_elements ? num_elements : 1);
+	int i;
 
-	(void)context; (void)size; (void)num_elements; (void)data;
+	(void)context;
 	if (!buf_id || !drv)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
-	(void)type;
-	*buf_id = (VABufferID)next_id(drv);
+
+	for (i = 0; i < MAX_BUFFERS; i++)
+		if (!drv->buffers[i].in_use) { b = &drv->buffers[i]; break; }
+	if (!b)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+
+	b->data = calloc(1, total ? total : 1);
+	if (!b->data)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	if (data && total)
+		memcpy(b->data, data, total);
+
+	b->id     = (VABufferID)next_id(drv);
+	b->type   = type;
+	b->size   = total;
+	b->in_use = 1;
+	*buf_id   = b->id;
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus loongvpu_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
 {
-	(void)ctx; (void)buf_id;
-	if (!pbuf)
+	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+	struct tracked_buffer *b;
+
+	if (!pbuf || !drv)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
-	*pbuf = NULL;
+	b = find_buffer(drv, buf_id);
+	if (!b)
+		return VA_STATUS_ERROR_INVALID_BUFFER;
+	*pbuf = b->data;
 	return VA_STATUS_SUCCESS;
 }
 
@@ -324,14 +472,28 @@ static VAStatus loongvpu_UnmapBuffer(VADriverContextP ctx, VABufferID buf_id)
 
 static VAStatus loongvpu_DestroyBuffer(VADriverContextP ctx, VABufferID buffer_id)
 {
-	(void)ctx; (void)buffer_id;
+	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+	struct tracked_buffer *b;
+
+	if (!drv)
+		return VA_STATUS_ERROR_INVALID_CONTEXT;
+	b = find_buffer(drv, buffer_id);
+	if (!b)
+		return VA_STATUS_ERROR_INVALID_BUFFER;
+	free(b->data);
+	b->in_use = 0;
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus loongvpu_BeginPicture(
 	VADriverContextP ctx, VAContextID context, VASurfaceID render_target)
 {
-	(void)ctx; (void)context; (void)render_target;
+	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+
+	(void)context;
+	if (!drv)
+		return VA_STATUS_ERROR_INVALID_CONTEXT;
+	drv->current_target = render_target;
 	return VA_STATUS_SUCCESS;
 }
 
@@ -339,16 +501,53 @@ static VAStatus loongvpu_RenderPicture(
 	VADriverContextP ctx, VAContextID context,
 	VABufferID *buffers, int num_buffers)
 {
-	(void)ctx; (void)context; (void)buffers; (void)num_buffers;
-	/* TODO: translate VA decode buffers into VPU register streams and
-	 * push them via DRM_IOCTL_HANTRO_* / HANTRODEC_IOCS_DEC_PUSH_REG. */
+	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+
+	(void)context;
+	if (!drv || !buffers || num_buffers <= 0)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	/* Buffers are now stored in the tracked table; EndPicture consumes
+	 * the first VASliceDataBufferType as the bitstream. */
 	return VA_STATUS_SUCCESS;
 }
 
 static VAStatus loongvpu_EndPicture(VADriverContextP ctx, VAContextID context)
 {
-	(void)ctx; (void)context;
-	return VA_STATUS_SUCCESS;
+	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+	struct tracked_surface *out;
+	struct tracked_buffer *bs = NULL;
+	int i, words;
+
+	(void)context;
+	if (!drv || !drv->vcmd)
+		return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+	out = find_surface(drv, drv->current_target);
+	if (!out)
+		return VA_STATUS_ERROR_INVALID_SURFACE;
+
+	/* Pick the first slice-data buffer (or any buffer with data) as bitstream. */
+	for (i = 0; i < MAX_BUFFERS; i++) {
+		if (drv->buffers[i].in_use &&
+		    drv->buffers[i].type == VASliceDataBufferType) {
+			bs = &drv->buffers[i];
+			break;
+		}
+	}
+	if (!bs) {
+		for (i = 0; i < MAX_BUFFERS; i++)
+			if (drv->buffers[i].in_use) { bs = &drv->buffers[i]; break; }
+	}
+
+	words = vcmd_h264_build_decode_cmd(
+		drv->cmd, VCMD_CMD_WORDS,
+		bs ? bs->data : NULL, bs ? bs->size : 0,
+		vpu_buffer_mmu(out->buf), vpu_buffer_id(out->buf));
+	if (words < 0)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	return vpu_vcmd_submit(drv->vcmd, drv->cmd, words) == 0
+	       ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_OPERATION_FAILED;
 }
 
 static VAStatus loongvpu_QueryDisplayAttributes(
