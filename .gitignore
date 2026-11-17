@@ -2,6 +2,7 @@
 *.o
 *.so
 tests/load_test
+tests/cmd_test
 
 # Local editor / OS files
 *.swp
