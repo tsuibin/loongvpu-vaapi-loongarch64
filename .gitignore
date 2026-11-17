@@ -1,0 +1,8 @@
+# Build artifacts
+*.o
+*.so
+tests/load_test
+
+# Local editor / OS files
+*.swp
+.DS_Store

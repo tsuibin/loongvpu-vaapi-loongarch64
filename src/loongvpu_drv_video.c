@@ -1,0 +1,573 @@
+/*
+ * loongvpu_drv_video.c -- open-source VA-API driver scaffold for LoongVPU.
+ *
+ * This is a WORKING SKELETON, not a complete hardware decoder.  It implements
+ * the libva entry point and the mandatory driver hooks so that the driver can
+ * be discovered and loaded by libva, advertises the codecs the LoongVPU VPU
+ * supports (H.264/H.265/AV1 decode, H.264/H.265 encode), establishes a DRM
+ * connection to the kernel driver, and provides object management stubs that
+ * can be filled in with real register-stream submission later.
+ *
+ * Kernel ABI: AOSC-Tracking/loongvpu-kernel-dkms (open source, GPL).
+ * This file is licensed under MIT so it can be freely reused.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+
+#include <va/va.h>
+#include <va/va_backend.h>
+
+#include "loongvpu_abi.h"
+
+#define LOONGVPU_DRIVER_NAME   "LoongVPU (open-source scaffold)"
+#define LOONGVPU_VENDOR        "loongvpu-vaapi"
+#define LOONGVPU_RENDER_NODE   "/dev/dri/renderD128"
+
+/* Driver-private data, reachable via ctx->pDriverData. */
+struct loongvpu_driver_data {
+	int            drm_fd;          /* fd of /dev/dri/renderD* */
+	int            vcmd_supported;  /* result of GET_VCMDSUP */
+	int            pm_supported;    /* result of GET_PMSUP */
+	unsigned int   asic_id;
+	char           render_node[64];
+};
+
+/* ------------------------------------------------------------------------- */
+/* DRM backend                                                                */
+/* ------------------------------------------------------------------------- */
+
+/* Open the render node and query basic capabilities from the kernel driver.
+ * Failures are soft: libva should still be able to load the driver even when
+ * no VPU hardware is present (e.g. on a build machine). */
+static void loongvpu_drm_init(struct loongvpu_driver_data *drv)
+{
+	int fd;
+	uint32_t sup = 0;
+
+	drv->drm_fd = -1;
+	snprintf(drv->render_node, sizeof(drv->render_node), "%s",
+	         LOONGVPU_RENDER_NODE);
+
+	fd = open(drv->render_node, O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		fprintf(stderr, "loongvpu: cannot open %s: %s\n",
+		        drv->render_node, strerror(errno));
+		return;
+	}
+
+	/* These ioctls are advisory; do not fail driver init if unsupported. */
+	if (ioctl(fd, DRM_IOCTL_HANTRO_GET_VCMDSUP, &sup) == 0)
+		drv->vcmd_supported = (int)sup;
+
+	sup = 0;
+	if (ioctl(fd, DRM_IOCTL_HANTRO_GET_PMSUP, &sup) == 0)
+		drv->pm_supported = (int)sup;
+
+	drv->drm_fd = fd;
+}
+
+static void loongvpu_drm_fini(struct loongvpu_driver_data *drv)
+{
+	if (drv->drm_fd >= 0) {
+		close(drv->drm_fd);
+		drv->drm_fd = -1;
+	}
+}
+
+/* ------------------------------------------------------------------------- */
+/* Mandatory libva hooks                                                      */
+/* ------------------------------------------------------------------------- */
+
+static VAStatus loongvpu_Terminate(VADriverContextP ctx)
+{
+	struct loongvpu_driver_data *drv;
+
+	if (!ctx)
+		return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+	drv = (struct loongvpu_driver_data *)ctx->pDriverData;
+	if (drv) {
+		loongvpu_drm_fini(drv);
+		free(drv);
+		ctx->pDriverData = NULL;
+	}
+	free(ctx->vtable);
+	ctx->vtable = NULL;
+
+	return VA_STATUS_SUCCESS;
+}
+
+/* Profiles advertised to libva.  These mirror what the closed-source driver
+ * exposes and what the VPU silicon supports per the AOSC release notes. */
+static const VAProfile supported_profiles[] = {
+	VAProfileH264ConstrainedBaseline,
+	VAProfileH264Main,
+	VAProfileH264High,
+	VAProfileHEVCMain,
+	VAProfileHEVCMain10,
+	VAProfileAV1Profile0,
+};
+
+static VAStatus loongvpu_QueryConfigProfiles(
+	VADriverContextP ctx,
+	VAProfile *profile_list,
+	int *num_profiles)
+{
+	unsigned int i;
+
+	(void)ctx;
+	if (!profile_list || !num_profiles)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+	for (i = 0; i < sizeof(supported_profiles)/sizeof(supported_profiles[0]); i++)
+		profile_list[i] = supported_profiles[i];
+
+	*num_profiles = (int)(sizeof(supported_profiles)/sizeof(supported_profiles[0]));
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_QueryConfigEntrypoints(
+	VADriverContextP ctx,
+	VAProfile profile,
+	VAEntrypoint *entrypoint_list,
+	int *num_entrypoints)
+{
+	unsigned int i;
+	int n = 0;
+
+	(void)ctx;
+	if (!entrypoint_list || !num_entrypoints)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+	/* Validate the profile is one we advertise. */
+	for (i = 0; i < sizeof(supported_profiles)/sizeof(supported_profiles[0]); i++) {
+		if (supported_profiles[i] == profile)
+			break;
+	}
+	if (i == sizeof(supported_profiles)/sizeof(supported_profiles[0]))
+		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+
+	entrypoint_list[n++] = VAEntrypointVLD;   /* hardware decode */
+
+	/* The VPU supports H.264/H.265 encode (not AV1 encode). */
+	if (profile == VAProfileH264ConstrainedBaseline || profile == VAProfileH264Main ||
+	    profile == VAProfileH264High || profile == VAProfileHEVCMain ||
+	    profile == VAProfileHEVCMain10)
+		entrypoint_list[n++] = VAEntrypointEncSlice;
+
+	*num_entrypoints = n;
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_GetConfigAttributes(
+	VADriverContextP ctx,
+	VAProfile profile,
+	VAEntrypoint entrypoint,
+	VAConfigAttrib *attrib_list,
+	int num_attribs)
+{
+	int i;
+
+	(void)ctx; (void)profile; (void)entrypoint;
+	if (!attrib_list)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+	for (i = 0; i < num_attribs; i++) {
+		switch (attrib_list[i].type) {
+		case VAConfigAttribRTFormat:
+			attrib_list[i].value = VA_RT_FORMAT_YUV420;
+			break;
+		case VAConfigAttribRateControl:
+			attrib_list[i].value = VA_RC_CBR | VA_RC_VBR | VA_RC_CQP;
+			break;
+		case VAConfigAttribDecSliceMode:
+			attrib_list[i].value = VA_DEC_SLICE_MODE_NORMAL;
+			break;
+		default:
+			attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
+			break;
+		}
+	}
+	return VA_STATUS_SUCCESS;
+}
+
+/* Simple monotonic ID allocator for skeleton objects. */
+static int next_id(struct loongvpu_driver_data *drv)
+{
+	static int id = 1;
+	(void)drv;
+	return id++;
+}
+
+static VAStatus loongvpu_CreateConfig(
+	VADriverContextP ctx,
+	VAProfile profile,
+	VAEntrypoint entrypoint,
+	VAConfigAttrib *attrib_list,
+	int num_attribs,
+	VAConfigID *config_id)
+{
+	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+
+	(void)profile; (void)entrypoint; (void)attrib_list; (void)num_attribs;
+	if (!config_id || !drv)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+	*config_id = (VAConfigID)next_id(drv);
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_DestroyConfig(VADriverContextP ctx, VAConfigID config_id)
+{
+	(void)ctx; (void)config_id;
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_QueryConfigAttributes(
+	VADriverContextP ctx, VAConfigID config_id,
+	VAProfile *profile, VAEntrypoint *entrypoint,
+	VAConfigAttrib *attrib_list, int *num_attribs)
+{
+	(void)ctx; (void)config_id;
+	if (profile) *profile = VAProfileH264High;
+	if (entrypoint) *entrypoint = VAEntrypointVLD;
+	if (num_attribs) *num_attribs = 0;
+	(void)attrib_list;
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_CreateSurfaces(
+	VADriverContextP ctx, int width, int height, int format,
+	int num_surfaces, VASurfaceID *surfaces)
+{
+	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+	int i;
+
+	if (!surfaces || num_surfaces <= 0 || !drv)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	(void)width; (void)height; (void)format;
+
+	/* Skeleton: hand out placeholder IDs.  Real implementation must
+	 * allocate DMA-BUFs and map them into the VPU via MMU ioctls. */
+	for (i = 0; i < num_surfaces; i++)
+		surfaces[i] = (VASurfaceID)next_id(drv);
+
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_DestroySurfaces(
+	VADriverContextP ctx, VASurfaceID *surface_list, int num_surfaces)
+{
+	(void)ctx; (void)surface_list; (void)num_surfaces;
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_CreateContext(
+	VADriverContextP ctx, VAConfigID config_id,
+	int picture_width, int picture_height, int flag,
+	VASurfaceID *render_targets, int num_render_targets,
+	VAContextID *context)
+{
+	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+
+	(void)config_id; (void)picture_width; (void)picture_height;
+	(void)flag; (void)render_targets; (void)num_render_targets;
+	if (!context || !drv)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+	*context = (VAContextID)next_id(drv);
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_DestroyContext(VADriverContextP ctx, VAContextID context)
+{
+	(void)ctx; (void)context;
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_CreateBuffer(
+	VADriverContextP ctx, VAContextID context, VABufferType type,
+	unsigned int size, unsigned int num_elements, void *data,
+	VABufferID *buf_id)
+{
+	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+
+	(void)context; (void)size; (void)num_elements; (void)data;
+	if (!buf_id || !drv)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	(void)type;
+	*buf_id = (VABufferID)next_id(drv);
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
+{
+	(void)ctx; (void)buf_id;
+	if (!pbuf)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	*pbuf = NULL;
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_UnmapBuffer(VADriverContextP ctx, VABufferID buf_id)
+{
+	(void)ctx; (void)buf_id;
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_DestroyBuffer(VADriverContextP ctx, VABufferID buffer_id)
+{
+	(void)ctx; (void)buffer_id;
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_BeginPicture(
+	VADriverContextP ctx, VAContextID context, VASurfaceID render_target)
+{
+	(void)ctx; (void)context; (void)render_target;
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_RenderPicture(
+	VADriverContextP ctx, VAContextID context,
+	VABufferID *buffers, int num_buffers)
+{
+	(void)ctx; (void)context; (void)buffers; (void)num_buffers;
+	/* TODO: translate VA decode buffers into VPU register streams and
+	 * push them via DRM_IOCTL_HANTRO_* / HANTRODEC_IOCS_DEC_PUSH_REG. */
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_EndPicture(VADriverContextP ctx, VAContextID context)
+{
+	(void)ctx; (void)context;
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_QueryDisplayAttributes(
+	VADriverContextP ctx, VADisplayAttribute *attr_list, int *num_attributes)
+{
+	(void)ctx; (void)attr_list;
+	if (num_attributes) *num_attributes = 0;
+	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus loongvpu_GetDisplayAttributes(
+	VADriverContextP ctx, VADisplayAttribute *attr_list, int num_attributes)
+{
+	(void)ctx; (void)attr_list; (void)num_attributes;
+	return VA_STATUS_SUCCESS;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Stub hooks for the remaining mandatory vtable entries.                     */
+/*                                                                            */
+/* libva checks that a broad set of vtable entries are non-NULL at init time. */
+/* The scaffold does not implement surfaces-as-images or subpictures, so these */
+/* return VA_STATUS_ERROR_UNIMPLEMENTED (or safe empty results where libva
+ * expects an out-parameter).  Real decode only needs a subset of these, but
+ * providing them keeps libva's loader happy. */
+/* ------------------------------------------------------------------------- */
+
+static VAStatus stub_unimplemented(void) { return VA_STATUS_ERROR_UNIMPLEMENTED; }
+
+#define STUB0(name) \
+	static VAStatus name(VADriverContextP c) { (void)c; return stub_unimplemented(); }
+
+static VAStatus loongvpu_BufferSetNumElements(
+	VADriverContextP c, VABufferID b, unsigned int n)
+{ (void)c; (void)b; (void)n; return stub_unimplemented(); }
+
+static VAStatus loongvpu_SyncSurface(VADriverContextP c, VASurfaceID s)
+{ (void)c; (void)s; return stub_unimplemented(); }
+
+static VAStatus loongvpu_QuerySurfaceStatus(
+	VADriverContextP c, VASurfaceID s, VASurfaceStatus *st)
+{ (void)c; (void)s; if (st) *st = VASurfaceReady; return VA_STATUS_SUCCESS; }
+
+static VAStatus loongvpu_QuerySurfaceError(
+	VADriverContextP c, VASurfaceID s, VAStatus es, void **ei)
+{ (void)c; (void)s; (void)es; if (ei) *ei = NULL; return stub_unimplemented(); }
+
+static VAStatus loongvpu_PutSurface(
+	VADriverContextP c, VASurfaceID s, void *d,
+	short sx, short sy, unsigned short sw, unsigned short sh,
+	short dx, short dy, unsigned short dw, unsigned short dh,
+	VARectangle *cr, unsigned int nc, unsigned int f)
+{ (void)c; (void)s; (void)d; (void)sx; (void)sy; (void)sw; (void)sh;
+  (void)dx; (void)dy; (void)dw; (void)dh; (void)cr; (void)nc; (void)f;
+  return stub_unimplemented(); }
+
+static VAStatus loongvpu_QueryImageFormats(
+	VADriverContextP c, VAImageFormat *fl, int *nf)
+{ (void)c; (void)fl; if (nf) *nf = 0; return VA_STATUS_SUCCESS; }
+
+static VAStatus loongvpu_CreateImage(
+	VADriverContextP c, VAImageFormat *f, int w, int h, VAImage *i)
+{ (void)c; (void)f; (void)w; (void)h; (void)i; return stub_unimplemented(); }
+
+static VAStatus loongvpu_DeriveImage(VADriverContextP c, VASurfaceID s, VAImage *i)
+{ (void)c; (void)s; (void)i; return stub_unimplemented(); }
+
+static VAStatus loongvpu_DestroyImage(VADriverContextP c, VAImageID i)
+{ (void)c; (void)i; return stub_unimplemented(); }
+
+static VAStatus loongvpu_SetImagePalette(VADriverContextP c, VAImageID i, unsigned char *p)
+{ (void)c; (void)i; (void)p; return stub_unimplemented(); }
+
+static VAStatus loongvpu_GetImage(
+	VADriverContextP c, VASurfaceID s, int x, int y,
+	unsigned int w, unsigned int h, VAImageID i)
+{ (void)c; (void)s; (void)x; (void)y; (void)w; (void)h; (void)i; return stub_unimplemented(); }
+
+static VAStatus loongvpu_PutImage(
+	VADriverContextP c, VASurfaceID s, VAImageID i,
+	int sx, int sy, unsigned int sw, unsigned int sh,
+	int dx, int dy, unsigned int dw, unsigned int dh)
+{ (void)c; (void)s; (void)i; (void)sx; (void)sy; (void)sw; (void)sh;
+  (void)dx; (void)dy; (void)dw; (void)dh; return stub_unimplemented(); }
+
+static VAStatus loongvpu_QuerySubpictureFormats(
+	VADriverContextP c, VAImageFormat *fl, unsigned int *flags, unsigned int *nf)
+{ (void)c; (void)fl; (void)flags; if (nf) *nf = 0; return VA_STATUS_SUCCESS; }
+
+static VAStatus loongvpu_CreateSubpicture(
+	VADriverContextP c, VAImageID i, VASubpictureID *sp)
+{ (void)c; (void)i; if (sp) *sp = 0; return stub_unimplemented(); }
+
+static VAStatus loongvpu_DestroySubpicture(VADriverContextP c, VASubpictureID sp)
+{ (void)c; (void)sp; return stub_unimplemented(); }
+
+static VAStatus loongvpu_SetSubpictureImage(VADriverContextP c, VASubpictureID sp, VAImageID i)
+{ (void)c; (void)sp; (void)i; return stub_unimplemented(); }
+
+static VAStatus loongvpu_SetSubpictureChromakey(
+	VADriverContextP c, VASubpictureID sp, unsigned int a, unsigned int b, unsigned int m)
+{ (void)c; (void)sp; (void)a; (void)b; (void)m; return stub_unimplemented(); }
+
+static VAStatus loongvpu_SetSubpictureGlobalAlpha(
+	VADriverContextP c, VASubpictureID sp, float a)
+{ (void)c; (void)sp; (void)a; return stub_unimplemented(); }
+
+static VAStatus loongvpu_AssociateSubpicture(
+	VADriverContextP c, VASubpictureID sp, VASurfaceID *ts, int ns,
+	short sx, short sy, unsigned short sw, unsigned short sh,
+	short dx, short dy, unsigned short dw, unsigned short dh, unsigned int f)
+{ (void)c; (void)sp; (void)ts; (void)ns; (void)sx; (void)sy; (void)sw; (void)sh;
+  (void)dx; (void)dy; (void)dw; (void)dh; (void)f; return stub_unimplemented(); }
+
+static VAStatus loongvpu_DeassociateSubpicture(
+	VADriverContextP c, VASubpictureID sp, VASurfaceID *ts, int ns)
+{ (void)c; (void)sp; (void)ts; (void)ns; return stub_unimplemented(); }
+
+static VAStatus loongvpu_SetDisplayAttributes(
+	VADriverContextP c, VADisplayAttribute *al, int na)
+{ (void)c; (void)al; (void)na; return stub_unimplemented(); }
+
+/* ------------------------------------------------------------------------- */
+/* Driver entry point                                                         */
+/* ------------------------------------------------------------------------- */
+
+/* libva calls __vaDriverInit_<major>_<minor> matching the ABI it wants.  The
+ * system libva is 1.23 which requests ABI 1.15 (see existing drv_video.so).
+ * We export both 1.15 and 1.23 covers for robustness. */
+static VAStatus loongvpu_DriverInit(VADriverContextP ctx)
+{
+	struct loongvpu_driver_data *drv;
+	struct VADriverVTable *vtable;
+
+	if (!ctx)
+		return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+	/* ctx->version_major / version_minor are filled in by libva before it
+	 * calls us (they describe the ABI version libva is requesting); the
+	 * driver must not overwrite them. */
+
+	drv = (struct loongvpu_driver_data *)calloc(1, sizeof(*drv));
+	vtable = (struct VADriverVTable *)calloc(1, sizeof(*vtable));
+	if (!drv || !vtable) {
+		free(drv);
+		free(vtable);
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	}
+
+	ctx->pDriverData = drv;
+	ctx->vtable = vtable;
+
+	/* Fill the mandatory vtable hooks. */
+	vtable->vaTerminate              = loongvpu_Terminate;
+	vtable->vaQueryConfigProfiles    = loongvpu_QueryConfigProfiles;
+	vtable->vaQueryConfigEntrypoints = loongvpu_QueryConfigEntrypoints;
+	vtable->vaGetConfigAttributes    = loongvpu_GetConfigAttributes;
+	vtable->vaCreateConfig           = loongvpu_CreateConfig;
+	vtable->vaDestroyConfig          = loongvpu_DestroyConfig;
+	vtable->vaQueryConfigAttributes  = loongvpu_QueryConfigAttributes;
+	vtable->vaCreateSurfaces         = loongvpu_CreateSurfaces;
+	vtable->vaDestroySurfaces        = loongvpu_DestroySurfaces;
+	vtable->vaCreateContext          = loongvpu_CreateContext;
+	vtable->vaDestroyContext         = loongvpu_DestroyContext;
+	vtable->vaCreateBuffer           = loongvpu_CreateBuffer;
+	vtable->vaMapBuffer              = loongvpu_MapBuffer;
+	vtable->vaUnmapBuffer            = loongvpu_UnmapBuffer;
+	vtable->vaDestroyBuffer          = loongvpu_DestroyBuffer;
+	vtable->vaBeginPicture           = loongvpu_BeginPicture;
+	vtable->vaRenderPicture          = loongvpu_RenderPicture;
+	vtable->vaEndPicture             = loongvpu_EndPicture;
+	vtable->vaQueryDisplayAttributes = loongvpu_QueryDisplayAttributes;
+	vtable->vaGetDisplayAttributes   = loongvpu_GetDisplayAttributes;
+
+	/* Remaining mandatory vtable entries (stubs) so libva's loader is
+	 * satisfied.  Only a subset is exercised by decode in the future. */
+	vtable->vaBufferSetNumElements   = loongvpu_BufferSetNumElements;
+	vtable->vaSyncSurface            = loongvpu_SyncSurface;
+	vtable->vaQuerySurfaceStatus     = loongvpu_QuerySurfaceStatus;
+	vtable->vaQuerySurfaceError      = loongvpu_QuerySurfaceError;
+	vtable->vaPutSurface             = loongvpu_PutSurface;
+	vtable->vaQueryImageFormats      = loongvpu_QueryImageFormats;
+	vtable->vaCreateImage            = loongvpu_CreateImage;
+	vtable->vaDeriveImage            = loongvpu_DeriveImage;
+	vtable->vaDestroyImage           = loongvpu_DestroyImage;
+	vtable->vaSetImagePalette        = loongvpu_SetImagePalette;
+	vtable->vaGetImage               = loongvpu_GetImage;
+	vtable->vaPutImage               = loongvpu_PutImage;
+	vtable->vaQuerySubpictureFormats = loongvpu_QuerySubpictureFormats;
+	vtable->vaCreateSubpicture       = loongvpu_CreateSubpicture;
+	vtable->vaDestroySubpicture      = loongvpu_DestroySubpicture;
+	vtable->vaSetSubpictureImage     = loongvpu_SetSubpictureImage;
+	vtable->vaSetSubpictureChromakey = loongvpu_SetSubpictureChromakey;
+	vtable->vaSetSubpictureGlobalAlpha = loongvpu_SetSubpictureGlobalAlpha;
+	vtable->vaAssociateSubpicture    = loongvpu_AssociateSubpicture;
+	vtable->vaDeassociateSubpicture  = loongvpu_DeassociateSubpicture;
+	vtable->vaSetDisplayAttributes   = loongvpu_SetDisplayAttributes;
+
+	/* ctx limits libva uses to size its own caches. */
+	ctx->max_profiles        = sizeof(supported_profiles)/sizeof(supported_profiles[0]);
+	ctx->max_entrypoints     = 3;   /* VLD, EncSlice (+ reserved) */
+	ctx->max_attributes      = 16;
+	ctx->max_image_formats   = 1;
+	ctx->max_subpic_formats  = 1;   /* libva requires > 0 */
+	ctx->str_vendor          = LOONGVPU_VENDOR;
+
+	loongvpu_drm_init(drv);
+
+	return VA_STATUS_SUCCESS;
+}
+
+/* Export the ABI 1.15 entry point (what libva 1.23 actually calls). */
+VAStatus __vaDriverInit_1_15(VADriverContextP ctx)
+{
+	return loongvpu_DriverInit(ctx);
+}
+
+/* Also export 1.23 in case a newer libva requests it directly. */
+VAStatus __vaDriverInit_1_23(VADriverContextP ctx)
+{
+	return loongvpu_DriverInit(ctx);
+}
