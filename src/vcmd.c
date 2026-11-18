@@ -321,6 +321,7 @@ int vcmd_hevc_build_decode_cmd(uint32_t *cmd, size_t cmd_words,
 	hevc_set_field(shadow, HF_DEC_CLK_GATE_E, 1);
 	hevc_set_field(shadow, HF_DEC_IRQ_DIS, 1);
 	hevc_set_field(shadow, HF_APF_THRESHOLD, 8);
+	hevc_set_field(shadow, HF_SCALING_LIST_E, prm->scaling_list_enable);
 
 	/* ---- DPB reference frames (15 slots) ---- */
 	for (i = 0; i < 15; i++) {

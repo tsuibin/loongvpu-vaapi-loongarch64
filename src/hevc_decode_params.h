@@ -76,6 +76,15 @@ struct hevc_decode_params {
 	unsigned long stream_mmu;
 	unsigned long scale_list_mmu;
 	unsigned long rlc_vlc_mmu;      /* HEVC work buffer */
+
+	/* Scaling lists (from VAIQMatrixBufferHEVC) */
+	uint8_t  scaling_list_enable;          /* SPS scaling_list_enabled_flag */
+	uint8_t  scaling_list4x4[6][16];
+	uint8_t  scaling_list8x8[6][64];
+	uint8_t  scaling_list16x16[6][64];
+	uint8_t  scaling_list32x32[2][64];
+	uint8_t  scaling_list_dc16[6];
+	uint8_t  scaling_list_dc32[2];
 };
 
 #endif /* HEVC_DECODE_PARAMS_H */

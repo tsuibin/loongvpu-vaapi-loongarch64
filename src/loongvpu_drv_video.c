@@ -31,6 +31,7 @@
 #include "h264_decode_params.h"
 #include "hevc_decode_params.h"
 #include "work_buffer.h"
+#include "hevc_work_buffer.h"
 
 #define LOONGVPU_DRIVER_NAME   "LoongVPU (open-source scaffold)"
 #define LOONGVPU_VENDOR        "loongvpu-vaapi"
@@ -85,6 +86,7 @@ struct loongvpu_driver_data {
 	/* Decoder work buffers (allocated lazily on first decode). */
 	struct vpu_buffer *rlc_vlc_work;   /* RLC/VLC + CABAC/POC work area */
 	struct vpu_buffer *mb_ctrl_work;   /* MB control work area */
+	struct vpu_buffer *scale_work;     /* HEVC scaling-list work area (1024 B) */
 	unsigned int       work_mbs;       /* macroblock count work was sized for */
 };
 
@@ -167,6 +169,10 @@ static void loongvpu_drm_fini(struct loongvpu_driver_data *drv)
 	if (drv->mb_ctrl_work) {
 		vpu_buffer_free(drv->mb_ctrl_work);
 		drv->mb_ctrl_work = NULL;
+	}
+	if (drv->scale_work) {
+		vpu_buffer_free(drv->scale_work);
+		drv->scale_work = NULL;
 	}
 
 	if (drv->vcmd) {
@@ -835,7 +841,7 @@ static VAStatus end_picture_hevc(VADriverContextP ctx, VAContextID context)
 	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
 	struct tracked_surface *out;
 	struct hevc_decode_params prm;
-	struct tracked_buffer *pic = NULL, *slice = NULL, *bsbuf = NULL;
+	struct tracked_buffer *pic = NULL, *slice = NULL, *bsbuf = NULL, *iq = NULL;
 	int i, words;
 
 	(void)context;
@@ -851,6 +857,7 @@ static VAStatus end_picture_hevc(VADriverContextP ctx, VAContextID context)
 		if (b->type == VAPictureParameterBufferType && !pic) pic = b;
 		else if (b->type == VASliceParameterBufferType && !slice) slice = b;
 		else if (b->type == VASliceDataBufferType && !bsbuf) bsbuf = b;
+		else if (b->type == VAIQMatrixBufferType && !iq) iq = b;
 	}
 	if (!pic || !slice)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
@@ -863,6 +870,7 @@ static VAStatus end_picture_hevc(VADriverContextP ctx, VAContextID context)
 		prm.pic_width_in_luma_samples  = p->pic_width_in_luma_samples;
 		prm.pic_height_in_luma_samples = p->pic_height_in_luma_samples;
 		prm.chroma_format_idc = p->pic_fields.bits.chroma_format_idc;
+		prm.scaling_list_enable = p->pic_fields.bits.scaling_list_enabled_flag;
 		prm.bit_depth_luma_minus8  = p->bit_depth_luma_minus8;
 		prm.bit_depth_chroma_minus8 = p->bit_depth_chroma_minus8;
 		prm.log2_min_cb_size  = p->log2_min_luma_coding_block_size_minus3 + 3;
@@ -939,7 +947,31 @@ static VAStatus end_picture_hevc(VADriverContextP ctx, VAContextID context)
 		ensure_work_buffers(drv, mbs);
 	}
 	prm.rlc_vlc_mmu = drv->rlc_vlc_work ? vpu_buffer_mmu(drv->rlc_vlc_work) : 0;
-	prm.scale_list_mmu = 0;  /* TODO: fill HEVC scaling-list buffer (VAIQMatrixBufferHEVC) */
+
+	/* HEVC scaling lists: map VAIQMatrixBufferHEVC into params, allocate a
+	 * dedicated 1 KiB work buffer, pack it per the SDK and set its VPU MMU
+	 * address (swreg 171/170). When scaling is disabled the register is off
+	 * and the address is unused. */
+	if (iq) {
+		VAIQMatrixBufferHEVC *q = iq->data;
+		memcpy(prm.scaling_list4x4,   q->ScalingList4x4,   sizeof(prm.scaling_list4x4));
+		memcpy(prm.scaling_list8x8,   q->ScalingList8x8,   sizeof(prm.scaling_list8x8));
+		memcpy(prm.scaling_list16x16, q->ScalingList16x16, sizeof(prm.scaling_list16x16));
+		memcpy(prm.scaling_list32x32, q->ScalingList32x32, sizeof(prm.scaling_list32x32));
+		memcpy(prm.scaling_list_dc16, q->ScalingListDC16x16, sizeof(prm.scaling_list_dc16));
+		memcpy(prm.scaling_list_dc32, q->ScalingListDC32x32, sizeof(prm.scaling_list_dc32));
+	}
+	if (prm.scaling_list_enable && drv->drm_fd >= 0) {
+		if (!drv->scale_work) {
+			drv->scale_work = vpu_buffer_alloc_bytes(drv->drm_fd, HEVC_WB_SCALE_BYTES);
+			if (drv->scale_work)
+				vpu_buffer_mmu_map(drv->scale_work, 0);
+		}
+		if (drv->scale_work) {
+			hevc_fill_scaling_list(vpu_buffer_vaddr(drv->scale_work), &prm);
+			prm.scale_list_mmu = vpu_buffer_mmu(drv->scale_work);
+		}
+	}
 
 	words = vcmd_hevc_build_decode_cmd(drv->cmd, VCMD_CMD_WORDS, &prm);
 	if (words < 0)

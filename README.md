@@ -84,11 +84,13 @@ Source layout:
   and the H.264 decode register programming.
 - `src/h264_regs.h` / `h264_decode_params.h` — H.264 VC8000D register map + VA params.
 - `src/hevc_regs.h` / `hevc_decode_params.h` — HEVC/H.265 register map + VA params.
+- `src/hevc_work_buffer.{c,h}` — HEVC scaling-list work-buffer packing.
 - `src/work_buffer.{c,h}` / `h264_cabac_init.h` — RLC/VLC work-buffer fill
   (CABAC init, POC table, scaling lists).
 - `tests/load_test.c` — hardware-free `dlopen()` smoke test.
 - `tests/cmd_test.c` — VCMD command-word + register encoding unit test.
-- `tests/workbuf_test.c` — work-buffer layout/content unit test.
+- `tests/workbuf_test.c` — H.264 work-buffer layout/content unit test.
+- `tests/hevcwb_test.c` — HEVC scaling-list work-buffer layout unit test.
 
 ## Build & test
 
@@ -140,9 +142,11 @@ Remaining (the hard part):
    `hevc_decode_params.h`, `vcmd_hevc_build_decode_cmd()` program the core
    SPS/PPS/slice registers, 15-slot DPB, reference lists and HEVC buffer
    aliases (stream 169/168, output Y 65/64 + C 99/98, scale list 171/170).
-   `vaEndPicture` routes by profile. Remaining: RPS / less-common fields,
-   HEVC scaling-list buffer contents. `config/context` profile tables added
-   for routing.
+   `vaEndPicture` routes by profile. HEVC scaling lists are packed into a
+   dedicated 1 KiB work buffer by `hevc_work_buffer.c` (DC@0, 4x4@16,
+   8x8@112, 16x16@496, 32x32@880, column-by-column per the SDK) from
+   `VAIQMatrixBufferHEVC`, with `HWIF_SCALING_LIST_E` programmed. Remaining:
+   RPS / less-common fields. `config/context` profile tables added for routing.
 8. **AV1**: extend the same approach (decode profile already advertised).
 9. **Encode path**: `VAEntrypointEncSlice` via `HANTROENC_IOC*` ioctls.
 10. **Browser integration**: even with a working driver, the AOSC advisory notes
