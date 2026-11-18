@@ -265,8 +265,11 @@ int vcmd_hevc_build_decode_cmd(uint32_t *cmd, size_t cmd_words,
 	unsigned int shadow[HEVC_REG_SHADOW_WORDS] = {0};
 	uint32_t *p = cmd;
 	uint32_t *end = cmd + cmd_words;
-	int i;
+	int i, n, j;
 	unsigned int mb_w, mb_h, valid_mask = 0, lterm_mask = 0;
+	unsigned int st_before[16], st_after[16], lt[16];
+	int n_before = 0, n_after = 0, n_lt = 0;
+	unsigned int list0[16], list1[16];
 
 	if (!cmd || !prm || cmd_words < 64)
 		return -1;
@@ -323,7 +326,7 @@ int vcmd_hevc_build_decode_cmd(uint32_t *cmd, size_t cmd_words,
 	hevc_set_field(shadow, HF_APF_THRESHOLD, 8);
 	hevc_set_field(shadow, HF_SCALING_LIST_E, prm->scaling_list_enable);
 
-	/* ---- DPB reference frames (15 slots) ---- */
+	/* ---- DPB reference frames (15 slots) + RPS categorization ---- */
 	for (i = 0; i < 15; i++) {
 		const struct hevc_dpb_ref *r = &prm->dpb[i];
 		unsigned long base = r->valid ? r->luma_mmu_addr
@@ -333,23 +336,51 @@ int vcmd_hevc_build_decode_cmd(uint32_t *cmd, size_t cmd_words,
 		if (r->valid) {
 			valid_mask |= 1u << i;
 			if (r->long_term) lterm_mask |= 1u << i;
+			/* Reference picture set categories from VA flags. The SDK
+			 * groups refs into ST-before / ST-after / LT-curr to build
+			 * the hardware L0/L1 lists (HevcInitRefPicList). */
+			if (r->rps_before) st_before[n_before++] = (unsigned int)i;
+			if (r->rps_after)  st_after[n_after++]  = (unsigned int)i;
+			if (r->rps_lt || r->long_term) lt[n_lt++] = (unsigned int)i;
+		}
+		/* POC difference to current picture, clipped to signed 8-bit
+		 * (HWIF_CUR_POC_00..15), per the SDK ref_poc_regs loop. */
+		{
+			int diff = prm->curr_poc - r->poc;
+			if (diff > 127) diff = 127;
+			if (diff < -128) diff = -128;
+			hevc_set_cur_poc(shadow, i, diff);
 		}
 	}
 	hevc_set_ref_valid(shadow, valid_mask);
 	hevc_set_ref_longterm(shadow, lterm_mask);
 
-	/* Reference list entries (HEVC VA RefPicList[n][] are DPB indices).
-	 * The SDK writes these via HWIF_INIT_RLIST_*; use the H.264-style list
-	 * registers here as the shared VC8000D reference-list mechanism. */
-	for (i = 0; i < 15; i++) {
-		unsigned int l0 = i < prm->ref_list0_count ? (prm->ref_list0[i] & 0x1f) : 0x1f;
-		unsigned int l1 = i < prm->ref_list1_count ? (prm->ref_list1[i] & 0x1f) : 0x1f;
-		struct h264_reg_field f0 = {14 + i / 3, 5, (i % 3) * 10};
-		struct h264_reg_field f1 = {14 + i / 3, 5, 5 + (i % 3) * 10};
-		shadow[f0.swreg] &= ~(0x1fu << f0.lsb);
-		shadow[f0.swreg] |= (l0 & 0x1f) << f0.lsb;
-		shadow[f1.swreg] &= ~(0x1fu << f1.lsb);
-		shadow[f1.swreg] |= (l1 & 0x1f) << f1.lsb;
+	/* Build L0 = ST-before + ST-after + LT, L1 = ST-after + ST-before + LT
+	 * and pad to 16 by repeating (SDK HevcInitRefPicList). Fall back to the
+	 * slice-provided RefPicList[] if no RPS flags were supplied. */
+	if (n_before || n_after || n_lt) {
+		int cnt = n_before + n_after + n_lt;
+		if (cnt > 16) cnt = 16;
+		j = 0;
+		for (n = 0; n < n_before && j < cnt; n++) list0[j++] = st_before[n];
+		for (n = 0; n < n_after  && j < cnt; n++) list0[j++] = st_after[n];
+		for (n = 0; n < n_lt     && j < cnt; n++) list0[j++] = lt[n];
+		j = 0;
+		for (n = 0; n < n_after  && j < cnt; n++) list1[j++] = st_after[n];
+		for (n = 0; n < n_before && j < cnt; n++) list1[j++] = st_before[n];
+		for (n = 0; n < n_lt     && j < cnt; n++) list1[j++] = lt[n];
+		/* pad by repeating from index 0 */
+		for (n = 0; j < 16; j++, n++) list0[j] = list0[n];
+		{ int k = cnt; n = 0; while (k < 16) list1[k++] = list1[n++]; }
+	} else {
+		for (i = 0; i < 16; i++) {
+			list0[i] = i < 15 ? (prm->ref_list0[i] & 0x1f) : 0x1f;
+			list1[i] = i < 15 ? (prm->ref_list1[i] & 0x1f) : 0x1f;
+		}
+	}
+	for (i = 0; i < 16; i++) {
+		hevc_set_rlist0(shadow, i, list0[i]);
+		hevc_set_rlist1(shadow, i, list1[i]);
 	}
 
 	/* ---- buffer addresses (HEVC aliases) ---- */

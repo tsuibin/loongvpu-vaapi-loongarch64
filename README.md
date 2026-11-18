@@ -145,8 +145,13 @@ Remaining (the hard part):
    `vaEndPicture` routes by profile. HEVC scaling lists are packed into a
    dedicated 1 KiB work buffer by `hevc_work_buffer.c` (DC@0, 4x4@16,
    8x8@112, 16x16@496, 32x32@880, column-by-column per the SDK) from
-   `VAIQMatrixBufferHEVC`, with `HWIF_SCALING_LIST_E` programmed. Remaining:
-   RPS / less-common fields. `config/context` profile tables added for routing.
+   `VAIQMatrixBufferHEVC`, with `HWIF_SCALING_LIST_E` programmed. RPS handling
+   done: `VAPictureHEVC` RPS flags (ST_CURR_BEFORE / ST_CURR_AFTER / LT_CURR)
+   build the hardware L0/L1 lists (`HevcInitRefPicList` order: L0=before+after+LT,
+   L1=after+before+LT, padded to 16), and reference POC differences are written
+   to `HWIF_CUR_POC_00..15` (swreg 46..49, signed 8-bit clipped). Remaining:
+   less-common fields (tiles/SAO details) and real-hardware validation.
+   `config/context` profile tables added for routing.
 8. **AV1**: extend the same approach (decode profile already advertised).
 9. **Encode path**: `VAEntrypointEncSlice` via `HANTROENC_IOC*` ioctls.
 10. **Browser integration**: even with a working driver, the AOSC advisory notes

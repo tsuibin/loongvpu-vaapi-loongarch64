@@ -923,9 +923,15 @@ static VAStatus end_picture_hevc(VADriverContextP ctx, VAContextID context)
 			prm.dpb[i].poc = r->pic_order_cnt;
 			prm.dpb[i].valid = !(r->flags & VA_PICTURE_HEVC_INVALID);
 			prm.dpb[i].long_term = !!(r->flags & VA_PICTURE_HEVC_LONG_TERM_REFERENCE);
+			/* RPS categories -> hardware L0/L1 list construction */
+			prm.dpb[i].rps_before = !!(r->flags & VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE);
+			prm.dpb[i].rps_after  = !!(r->flags & VA_PICTURE_HEVC_RPS_ST_CURR_AFTER);
+			prm.dpb[i].rps_lt     = !!(r->flags & VA_PICTURE_HEVC_RPS_LT_CURR);
 			surf = prm.dpb[i].valid ? find_surface(drv, r->picture_id) : NULL;
 			prm.dpb[i].luma_mmu_addr = surf ? vpu_buffer_mmu(surf->buf) : 0;
 		}
+		/* Current picture POC for the RPS POC-difference registers. */
+		prm.curr_poc = p->CurrPic.pic_order_cnt;
 
 		/* Reference lists: RefPicList[2][15] are DPB indices. */
 		for (i = 0; i < 15; i++) {

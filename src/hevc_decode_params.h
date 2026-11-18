@@ -4,12 +4,20 @@
 #include <stdint.h>
 
 /* Plain-C subset of VA-API HEVC decode params for VC8000D register programming. */
+/* VA_PICTURE_HEVC_RPS_* flags, used to build the hardware reference lists. */
+#define HEVC_RPS_ST_CURR_BEFORE 0x10u
+#define HEVC_RPS_ST_CURR_AFTER  0x20u
+#define HEVC_RPS_LT_CURR        0x40u
+
 struct hevc_dpb_ref {
 	unsigned long luma_mmu_addr;
 	unsigned long chroma_mmu_addr;
 	int32_t       poc;
 	uint8_t       valid;
 	uint8_t       long_term;
+	uint8_t       rps_before;     /* CURR_BEFORE */
+	uint8_t       rps_after;      /* CURR_AFTER */
+	uint8_t       rps_lt;         /* LT_CURR */
 };
 
 struct hevc_decode_params {
@@ -62,6 +70,7 @@ struct hevc_decode_params {
 	uint32_t slice_data_size;
 	uint32_t slice_data_byte_offset;
 	uint8_t  slice_type;            /* 0=B,1=P,2=I per VA */
+	int32_t  curr_poc;              /* current picture POC, for RPS POC diffs */
 
 	/* DPB (15 refs per HEVC VA) + ref lists */
 	struct hevc_dpb_ref dpb[15];

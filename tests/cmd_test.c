@@ -265,6 +265,51 @@ static int test_hevc_stream(void)
 	return 0;
 }
 
+static int test_hevc_rps(void)
+{
+	uint32_t cmd[256];
+	struct hevc_decode_params prm;
+	int words, i;
+	int got_poc0 = 0, got_poc1 = 0, got_poc2 = 0, got_l0 = 0;
+
+	memset(&prm, 0, sizeof(prm));
+	prm.pic_width_in_luma_samples  = 64;
+	prm.pic_height_in_luma_samples = 64;
+	prm.curr_poc = 100;
+
+	/* ref0: ST-before, POC=90 -> diff=+10; ref1: ST-after, POC=110 -> -10;
+	 * ref2: LT, POC=0 -> diff=+100 (within 127). */
+	prm.dpb[0].valid = 1; prm.dpb[0].poc = 90;  prm.dpb[0].rps_before = 1;
+	prm.dpb[1].valid = 1; prm.dpb[1].poc = 110; prm.dpb[1].rps_after = 1;
+	prm.dpb[2].valid = 1; prm.dpb[2].poc = 0;   prm.dpb[2].rps_lt = 1; prm.dpb[2].long_term = 1;
+
+	words = vcmd_hevc_build_decode_cmd(cmd, 256, &prm);
+	if (words < 10) return 1;
+
+	for (i = 0; i < words; ) {
+		uint32_t op = cmd[i] & 0xf8000000u, off, val;
+		if (op == OPCODE_END) { i++; break; }
+		if (op != OPCODE_WREG) return 1;
+		off = cmd[i] & 0xffffu;
+		val = cmd[i + 1];
+		/* CUR_POC_00 = swreg46 lsb24, CUR_POC_01 lsb16, CUR_POC_02 lsb8 */
+		if (off == 46 * 4) {
+			if (((val >> 24) & 0xff) == 10)  got_poc0 = 1;   /* 100-90 */
+			if (((val >> 16) & 0xff) == 0xf6) got_poc1 = 1;   /* -10 = 0xf6 */
+			if (((val >> 8)  & 0xff) == 100) got_poc2 = 1;    /* 100-0 */
+		}
+		/* INIT_RLIST_F0 = swreg14 lsb0: L0[0] should be ST-before ref0 = 0 */
+		if (off == 14 * 4 && (val & 0x1f) == 0) got_l0 = 1;
+		i += 2;
+	}
+	if (!got_poc0 || !got_poc1 || !got_poc2 || !got_l0) {
+		fprintf(stderr, "RPS: poc0=%d poc1=%d poc2=%d l0=%d\n",
+		        got_poc0, got_poc1, got_poc2, got_l0);
+		return 1;
+	}
+	return 0;
+}
+
 int main(void)
 {
 	if (test_opcodes())   { fprintf(stderr, "FAIL: opcodes\n"); return 1; }
@@ -274,6 +319,7 @@ int main(void)
 	if (test_h264_dpb_stream()) { fprintf(stderr, "FAIL: h264 dpb stream\n"); return 1; }
 	if (test_work_addresses()) { fprintf(stderr, "FAIL: work addresses\n"); return 1; }
 	if (test_hevc_stream()) { fprintf(stderr, "FAIL: hevc stream\n"); return 1; }
-	printf("cmd_test PASSED (opcodes + H.264 + DPB + work addresses + HEVC)\n");
+	if (test_hevc_rps()) { fprintf(stderr, "FAIL: hevc rps\n"); return 1; }
+	printf("cmd_test PASSED (opcodes + H.264 + DPB + work + HEVC + RPS)\n");
 	return 0;
 }

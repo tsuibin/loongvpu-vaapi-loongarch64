@@ -125,4 +125,31 @@ static inline void hevc_set_ref_longterm(unsigned int *shadow, unsigned int mask
 	shadow[38] = mask;
 }
 
+/* HEVC reference POC differences: HWIF_CUR_POC_00..15 are 8-bit fields,
+ * 4 per 32-bit register at swreg 46..49, lsb = 24 - (i%4)*8. */
+static inline void hevc_set_cur_poc(unsigned int *shadow, int i, int diff)
+{
+	unsigned int swreg = 46 + i / 4;
+	unsigned int lsb = 24 - (i % 4) * 8;
+	unsigned int val = (unsigned int)(diff & 0xff);
+	shadow[swreg] &= ~(0xffu << lsb);
+	shadow[swreg] |= (val & 0xffu) << lsb;
+}
+
+/* HEVC reference list registers (shared VC8000D INIT_RLIST):
+ *   INIT_RLIST_F0..15 = swreg {14..19}, lsb (i%3)*10
+ *   INIT_RLIST_B0..15 = swreg {14..19}, lsb 5+(i%3)*10 */
+static inline void hevc_set_rlist0(unsigned int *shadow, int i, unsigned int v)
+{
+	unsigned int swreg = 14 + i / 3, lsb = (i % 3) * 10;
+	shadow[swreg] &= ~(0x1fu << lsb);
+	shadow[swreg] |= (v & 0x1fu) << lsb;
+}
+static inline void hevc_set_rlist1(unsigned int *shadow, int i, unsigned int v)
+{
+	unsigned int swreg = 14 + i / 3, lsb = 5 + (i % 3) * 10;
+	shadow[swreg] &= ~(0x1fu << lsb);
+	shadow[swreg] |= (v & 0x1fu) << lsb;
+}
+
 #endif /* HEVC_REGS_H */
