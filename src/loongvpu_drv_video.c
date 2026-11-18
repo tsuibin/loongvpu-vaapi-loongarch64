@@ -23,11 +23,13 @@
 
 #include <va/va.h>
 #include <va/va_backend.h>
+#include <va/va_dec_hevc.h>
 
 #include "loongvpu_abi.h"
 #include "vpu_buffer.h"
 #include "vcmd.h"
 #include "h264_decode_params.h"
+#include "hevc_decode_params.h"
 #include "work_buffer.h"
 
 #define LOONGVPU_DRIVER_NAME   "LoongVPU (open-source scaffold)"
@@ -70,6 +72,15 @@ struct loongvpu_driver_data {
 	struct tracked_buffer  buffers[MAX_BUFFERS];
 	VASurfaceID            current_target;       /* from vaBeginPicture */
 	uint32_t               cmd[VCMD_CMD_WORDS];  /* scratch command buffer */
+
+	/* codec routing: config/profile tables and active context profile */
+	VAConfigID   config_ids[MAX_BUFFERS];
+	VAProfile    config_profiles[MAX_BUFFERS];
+	int          config_count;
+	VAContextID  context_ids[MAX_BUFFERS];
+	VAProfile    context_profiles[MAX_BUFFERS];
+	int          context_count;
+	VAProfile    current_profile;                /* set in vaBeginPicture */
 
 	/* Decoder work buffers (allocated lazily on first decode). */
 	struct vpu_buffer *rlc_vlc_work;   /* RLC/VLC + CABAC/POC work area */
@@ -303,13 +314,30 @@ static VAStatus loongvpu_CreateConfig(
 	VAConfigID *config_id)
 {
 	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+	int id;
 
-	(void)profile; (void)entrypoint; (void)attrib_list; (void)num_attribs;
+	(void)entrypoint; (void)attrib_list; (void)num_attribs;
 	if (!config_id || !drv)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	if (drv->config_count >= MAX_BUFFERS)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
-	*config_id = (VAConfigID)next_id(drv);
+	id = next_id(drv);
+	drv->config_ids[drv->config_count] = (VAConfigID)id;
+	drv->config_profiles[drv->config_count] = profile;
+	drv->config_count++;
+	*config_id = (VAConfigID)id;
 	return VA_STATUS_SUCCESS;
+}
+
+/* Look up the profile recorded for a config; default H.264 if unknown. */
+static VAProfile config_profile(struct loongvpu_driver_data *drv, VAConfigID id)
+{
+	int i;
+	for (i = 0; i < drv->config_count; i++)
+		if (drv->config_ids[i] == id)
+			return drv->config_profiles[i];
+	return VAProfileH264High;
 }
 
 static VAStatus loongvpu_DestroyConfig(VADriverContextP ctx, VAConfigID config_id)
@@ -428,14 +456,31 @@ static VAStatus loongvpu_CreateContext(
 	VAContextID *context)
 {
 	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+	int id;
 
-	(void)config_id; (void)picture_width; (void)picture_height;
-	(void)flag; (void)render_targets; (void)num_render_targets;
+	(void)picture_width; (void)picture_height; (void)flag;
+	(void)render_targets; (void)num_render_targets;
 	if (!context || !drv)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	if (drv->context_count >= MAX_BUFFERS)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
-	*context = (VAContextID)next_id(drv);
+	id = next_id(drv);
+	drv->context_ids[drv->context_count] = (VAContextID)id;
+	drv->context_profiles[drv->context_count] = config_profile(drv, config_id);
+	drv->context_count++;
+	*context = (VAContextID)id;
 	return VA_STATUS_SUCCESS;
+}
+
+/* Look up the profile recorded for a context. */
+static VAProfile context_profile(struct loongvpu_driver_data *drv, VAContextID id)
+{
+	int i;
+	for (i = 0; i < drv->context_count; i++)
+		if (drv->context_ids[i] == id)
+			return drv->context_profiles[i];
+	return VAProfileH264High;
 }
 
 static VAStatus loongvpu_DestroyContext(VADriverContextP ctx, VAContextID context)
@@ -550,10 +595,10 @@ static VAStatus loongvpu_BeginPicture(
 {
 	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
 
-	(void)context;
 	if (!drv)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
-	drv->current_target = render_target;
+	drv->current_target  = render_target;
+	drv->current_profile = context_profile(drv, context);
 	return VA_STATUS_SUCCESS;
 }
 
@@ -615,7 +660,8 @@ static VAStatus ensure_work_buffers(struct loongvpu_driver_data *drv,
 	return VA_STATUS_SUCCESS;
 }
 
-static VAStatus loongvpu_EndPicture(VADriverContextP ctx, VAContextID context)
+/* H.264 decode submission (vaEndPicture for AVC configs). */
+static VAStatus end_picture_h264(VADriverContextP ctx, VAContextID context)
 {
 	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
 	struct tracked_surface *out;
@@ -776,6 +822,142 @@ static VAStatus loongvpu_EndPicture(VADriverContextP ctx, VAContextID context)
 
 	return vpu_vcmd_submit(drv->vcmd, drv->cmd, words) == 0
 	       ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_OPERATION_FAILED;
+}
+
+static int is_hevc_profile(VAProfile p)
+{
+	return p == VAProfileHEVCMain || p == VAProfileHEVCMain10;
+}
+
+/* HEVC/H.265 decode submission (vaEndPicture for HEVC configs). */
+static VAStatus end_picture_hevc(VADriverContextP ctx, VAContextID context)
+{
+	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+	struct tracked_surface *out;
+	struct hevc_decode_params prm;
+	struct tracked_buffer *pic = NULL, *slice = NULL, *bsbuf = NULL;
+	int i, words;
+
+	(void)context;
+	if (!drv || !drv->vcmd)
+		return VA_STATUS_ERROR_INVALID_CONTEXT;
+	out = find_surface(drv, drv->current_target);
+	if (!out)
+		return VA_STATUS_ERROR_INVALID_SURFACE;
+
+	for (i = 0; i < MAX_BUFFERS; i++) {
+		struct tracked_buffer *b = &drv->buffers[i];
+		if (!b->in_use) continue;
+		if (b->type == VAPictureParameterBufferType && !pic) pic = b;
+		else if (b->type == VASliceParameterBufferType && !slice) slice = b;
+		else if (b->type == VASliceDataBufferType && !bsbuf) bsbuf = b;
+	}
+	if (!pic || !slice)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+	memset(&prm, 0, sizeof(prm));
+	{
+		VAPictureParameterBufferHEVC *p = pic->data;
+		VASliceParameterBufferHEVC *s = slice->data;
+
+		prm.pic_width_in_luma_samples  = p->pic_width_in_luma_samples;
+		prm.pic_height_in_luma_samples = p->pic_height_in_luma_samples;
+		prm.chroma_format_idc = p->pic_fields.bits.chroma_format_idc;
+		prm.bit_depth_luma_minus8  = p->bit_depth_luma_minus8;
+		prm.bit_depth_chroma_minus8 = p->bit_depth_chroma_minus8;
+		prm.log2_min_cb_size  = p->log2_min_luma_coding_block_size_minus3 + 3;
+		prm.log2_max_cb_size  = prm.log2_min_cb_size +
+		                        p->log2_diff_max_min_luma_coding_block_size;
+		prm.log2_min_trb_size = p->log2_min_transform_block_size_minus2 + 2;
+		prm.log2_max_trb_size = prm.log2_min_trb_size +
+		                        p->log2_diff_max_min_transform_block_size;
+		prm.max_dec_pic_buffering = p->sps_max_dec_pic_buffering_minus1 + 1;
+		prm.pcm_enabled   = p->pic_fields.bits.pcm_enabled_flag;
+		prm.max_transform_hierarchy_depth_intra = p->max_transform_hierarchy_depth_intra;
+		prm.max_transform_hierarchy_depth_inter = p->max_transform_hierarchy_depth_inter;
+		prm.log2_parallel_merge_level = p->log2_parallel_merge_level_minus2 + 2;
+
+		prm.init_qp_minus26      = p->init_qp_minus26;
+		prm.cb_qp_offset         = p->pps_cb_qp_offset;
+		prm.cr_qp_offset         = p->pps_cr_qp_offset;
+		prm.diff_cu_qp_delta_depth = p->diff_cu_qp_delta_depth;
+		prm.num_ref_idx_l0_active = s->num_ref_idx_l0_active_minus1 + 1;
+		prm.num_ref_idx_l1_active = s->num_ref_idx_l1_active_minus1 + 1;
+		prm.weighted_pred_flag   = p->pic_fields.bits.weighted_pred_flag;
+		prm.weighted_bipred_flag = p->pic_fields.bits.weighted_bipred_flag;
+		prm.cu_qp_delta_enabled  = p->pic_fields.bits.cu_qp_delta_enabled_flag;
+		prm.constrained_intra_pred = p->pic_fields.bits.constrained_intra_pred_flag;
+		prm.transform_skip_enabled = p->pic_fields.bits.transform_skip_enabled_flag;
+		prm.sign_data_hiding = p->pic_fields.bits.sign_data_hiding_enabled_flag;
+		prm.lists_modification_present = p->slice_parsing_fields.bits.lists_modification_present_flag;
+		prm.cabac_init_present = p->slice_parsing_fields.bits.cabac_init_present_flag;
+		prm.temporal_mvp_enabled = p->slice_parsing_fields.bits.sps_temporal_mvp_enabled_flag;
+		prm.sample_adaptive_offset_enabled = p->slice_parsing_fields.bits.sample_adaptive_offset_enabled_flag;
+		prm.strong_intra_smoothing = p->pic_fields.bits.strong_intra_smoothing_enabled_flag;
+		prm.entropy_coding_sync_enabled = p->pic_fields.bits.entropy_coding_sync_enabled_flag;
+		prm.deblocking_filter_override = p->slice_parsing_fields.bits.deblocking_filter_override_enabled_flag;
+		prm.disable_deblocking_filter = p->slice_parsing_fields.bits.pps_disable_deblocking_filter_flag;
+		prm.slice_segment_header_extension_present =
+		        p->slice_parsing_fields.bits.slice_segment_header_extension_present_flag;
+		prm.idr_pic_flag = p->slice_parsing_fields.bits.IdrPicFlag;
+		prm.rap_pic_flag = p->slice_parsing_fields.bits.RapPicFlag;
+		prm.dependent_slice_segments = p->slice_parsing_fields.bits.dependent_slice_segments_enabled_flag;
+		prm.slice_hdr_extra_bits = p->num_extra_slice_header_bits;
+
+		prm.slice_data_size = s->slice_data_size;
+		prm.slice_data_byte_offset = s->slice_data_byte_offset;
+		prm.slice_type = s->LongSliceFlags.fields.slice_type;
+
+		/* DPB: 15 reference frames, picture_id -> surface MMU address. */
+		for (i = 0; i < 15; i++) {
+			VAPictureHEVC *r = &p->ReferenceFrames[i];
+			struct tracked_surface *surf;
+			prm.dpb[i].poc = r->pic_order_cnt;
+			prm.dpb[i].valid = !(r->flags & VA_PICTURE_HEVC_INVALID);
+			prm.dpb[i].long_term = !!(r->flags & VA_PICTURE_HEVC_LONG_TERM_REFERENCE);
+			surf = prm.dpb[i].valid ? find_surface(drv, r->picture_id) : NULL;
+			prm.dpb[i].luma_mmu_addr = surf ? vpu_buffer_mmu(surf->buf) : 0;
+		}
+
+		/* Reference lists: RefPicList[2][15] are DPB indices. */
+		for (i = 0; i < 15; i++) {
+			prm.ref_list0[i] = s->RefPicList[0][i];
+			prm.ref_list1[i] = s->RefPicList[1][i];
+			if (s->RefPicList[0][i] != 0xff) prm.ref_list0_count = i + 1;
+			if (s->RefPicList[1][i] != 0xff) prm.ref_list1_count = i + 1;
+		}
+	}
+
+	prm.output_y_mmu = vpu_buffer_mmu(out->buf);
+	prm.stream_mmu = (bsbuf && bsbuf->vpu_buf)
+	               ? vpu_buffer_mmu(bsbuf->vpu_buf) : 0;
+
+	/* HEVC work buffer (scale list at swreg 171/170). Reuse the work buffer. */
+	{
+		unsigned int mbs = ((prm.pic_width_in_luma_samples + 15) / 16) *
+		                   ((prm.pic_height_in_luma_samples + 15) / 16);
+		ensure_work_buffers(drv, mbs);
+	}
+	prm.rlc_vlc_mmu = drv->rlc_vlc_work ? vpu_buffer_mmu(drv->rlc_vlc_work) : 0;
+	prm.scale_list_mmu = 0;  /* TODO: fill HEVC scaling-list buffer (VAIQMatrixBufferHEVC) */
+
+	words = vcmd_hevc_build_decode_cmd(drv->cmd, VCMD_CMD_WORDS, &prm);
+	if (words < 0)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+	return vpu_vcmd_submit(drv->vcmd, drv->cmd, words) == 0
+	       ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_OPERATION_FAILED;
+}
+
+/* Dispatch vaEndPicture by the configured codec profile. */
+static VAStatus loongvpu_EndPicture(VADriverContextP ctx, VAContextID context)
+{
+	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+
+	if (!drv)
+		return VA_STATUS_ERROR_INVALID_CONTEXT;
+	if (is_hevc_profile(drv->current_profile))
+		return end_picture_hevc(ctx, context);
+	return end_picture_h264(ctx, context);
 }
 
 static VAStatus loongvpu_QueryDisplayAttributes(

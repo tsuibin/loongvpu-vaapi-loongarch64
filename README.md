@@ -4,7 +4,7 @@ An **open-source VA-API driver scaffold** for the Loongson **LoongVPU** video
 processing unit (found in 2K3000 / 3B6000M SoCs, including the LG200-based
 platforms).
 
-> **Status: H.264 register programming implemented from an open VC8000D SDK.**
+> **Status: H.264 and HEVC/H.265 register programming implemented from an open VC8000D SDK.**
 > The driver allocates real GEM/DMA buffers, maps them into the VPU MMU, and
 > drives the full VCMD reserve → link/run → wait → release submission flow.
 > The H.264 register sequence is now **real, not a stub**: `h264_regs.h` is
@@ -16,8 +16,11 @@ platforms).
 > REF0 POC) plus P/B reference lists, all mapped from VA-API
 > `VAPictureParameterBufferH264`, with DPB POC, CABAC init table and scaling
 > lists populated into the RLC/VLC work buffer. The full H.264 decode path is
-> now wired end to end; what remains is validation on real hardware and
-> extending the same approach to H.265/AV1 (see Roadmap).
+> now wired end to end. An HEVC/H.265 decode path (`hevc_regs.h`,
+> `hevc_decode_params.h`, `vcmd_hevc_build_decode_cmd`, codec routing in
+> `vaEndPicture`) programs the core HEVC decode registers from VA-API HEVC
+> params. What remains is validation on real hardware, the less-common HEVC
+> register fields / RPS handling, and AV1 (see Roadmap).
 > Without a real LoongVPU device the driver soft-degrades to "decode disabled"
 > but still loads.
 
@@ -79,7 +82,8 @@ Source layout:
 - `src/vpu_buffer.{c,h}` — GEM/DMA-BUF allocation + VPU MMU map/unmap.
 - `src/vcmd.{c,h}` — VCMD command builders, pool setup, reserve→run→wait→release,
   and the H.264 decode register programming.
-- `src/h264_regs.h` / `h264_decode_params.h` — VC8000D register map + VA params.
+- `src/h264_regs.h` / `h264_decode_params.h` — H.264 VC8000D register map + VA params.
+- `src/hevc_regs.h` / `hevc_decode_params.h` — HEVC/H.265 register map + VA params.
 - `src/work_buffer.{c,h}` / `h264_cabac_init.h` — RLC/VLC work-buffer fill
   (CABAC init, POC table, scaling lists).
 - `tests/load_test.c` — hardware-free `dlopen()` smoke test.
@@ -132,9 +136,16 @@ Remaining (the hard part):
    POC per `h264PreparePOC`), scaling lists @3816 (6x4x4 + 2x8x8 packed
    big-endian per `h264PrepareScaleList`). Also programs `PICORD_COUNT_E`
    and `TYPE1_QUANT_E`.
-7. **Per-codec support**: extend the same approach to H.265, then AV1.
-8. **Encode path**: `VAEntrypointEncSlice` via `HANTROENC_IOC*` ioctls.
-9. **Browser integration**: even with a working driver, the AOSC advisory notes
+7. **HEVC/H.265** — core DONE. `hevc_regs.h` (register map, DEC_MODE=12),
+   `hevc_decode_params.h`, `vcmd_hevc_build_decode_cmd()` program the core
+   SPS/PPS/slice registers, 15-slot DPB, reference lists and HEVC buffer
+   aliases (stream 169/168, output Y 65/64 + C 99/98, scale list 171/170).
+   `vaEndPicture` routes by profile. Remaining: RPS / less-common fields,
+   HEVC scaling-list buffer contents. `config/context` profile tables added
+   for routing.
+8. **AV1**: extend the same approach (decode profile already advertised).
+9. **Encode path**: `VAEntrypointEncSlice` via `HANTROENC_IOC*` ioctls.
+10. **Browser integration**: even with a working driver, the AOSC advisory notes
    Chromium currently fails to use VA-API on this VPU; mpv/GStreamer are easier
    early test targets.
 

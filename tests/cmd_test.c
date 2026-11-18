@@ -1,5 +1,5 @@
 /*
- * cmd_test.c - unit tests for VCMD command builders and H.264 register
+ * cmd_test.c - unit tests for VCMD command builders and H.264/HEVC register
  * programming (no hardware needed).
  */
 #include <stdio.h>
@@ -9,6 +9,8 @@
 #include "vcmd.h"
 #include "h264_regs.h"
 #include "h264_decode_params.h"
+#include "hevc_regs.h"
+#include "hevc_decode_params.h"
 
 static int test_opcodes(void)
 {
@@ -209,6 +211,53 @@ static int test_work_addresses(void)
 	return 0;
 }
 
+static int test_hevc_stream(void)
+{
+	uint32_t cmd[256];
+	struct hevc_decode_params prm;
+	int words, i, found_mode = 0, found_stream = 0, found_out_y = 0, found_dec_e = 0;
+
+	memset(&prm, 0, sizeof(prm));
+	prm.pic_width_in_luma_samples  = 1920;
+	prm.pic_height_in_luma_samples = 1088;
+	prm.max_dec_pic_buffering = 4;
+	prm.init_qp_minus26 = 0;
+	prm.log2_min_cb_size = 5;   /* 32x32 min CB */
+	prm.log2_max_cb_size = 6;   /* 64x64 max CB */
+	prm.idr_pic_flag = 1;
+	prm.dpb[0].valid = 1;
+	prm.dpb[0].poc = 8;
+	prm.dpb[0].luma_mmu_addr = 0x12345000;
+	prm.ref_list0[0] = 0;
+	prm.ref_list0_count = 1;
+	prm.slice_type = 2; /* I */
+	prm.stream_mmu = 0x11000000ULL;
+	prm.output_y_mmu = 0x22000000ULL;
+	prm.output_c_mmu = 0x33000000ULL;
+
+	words = vcmd_hevc_build_decode_cmd(cmd, 256, &prm);
+	if (words < 10) return 1;
+
+	for (i = 0; i < words; ) {
+		uint32_t op = cmd[i] & 0xf8000000u;
+		uint32_t off, val;
+		if (op == OPCODE_END) { i++; break; }
+		if (op != OPCODE_WREG) return 1;
+		off = cmd[i] & 0xffffu;
+		val = cmd[i + 1];
+		/* DEC_MODE: swreg 3, lsb 27, value 12 */
+		if (off == (uint32_t)hevc_fields[HF_DEC_MODE].swreg * 4 &&
+		    ((val >> 27) & 0x1f) == DEC_MODE_HEVC) found_mode = 1;
+		if (off == 169 * 4 && val == 0x11000000u) found_stream = 1;
+		if (off == 65 * 4 && val == 0x22000000u) found_out_y = 1;
+		if (off == (uint32_t)hevc_fields[HF_DEC_E].swreg * 4 && (val & 0x1)) found_dec_e = 1;
+		i += 2;
+	}
+	if (i != words) return 1;
+	if (!found_mode || !found_stream || !found_out_y || !found_dec_e) return 1;
+	return 0;
+}
+
 int main(void)
 {
 	if (test_opcodes())   { fprintf(stderr, "FAIL: opcodes\n"); return 1; }
@@ -217,6 +266,7 @@ int main(void)
 	if (test_dpb()) { fprintf(stderr, "FAIL: dpb registers\n"); return 1; }
 	if (test_h264_dpb_stream()) { fprintf(stderr, "FAIL: h264 dpb stream\n"); return 1; }
 	if (test_work_addresses()) { fprintf(stderr, "FAIL: work addresses\n"); return 1; }
-	printf("cmd_test PASSED (opcodes + masking + H.264 + DPB + work addresses)\n");
+	if (test_hevc_stream()) { fprintf(stderr, "FAIL: hevc stream\n"); return 1; }
+	printf("cmd_test PASSED (opcodes + H.264 + DPB + work addresses + HEVC)\n");
 	return 0;
 }
