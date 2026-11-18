@@ -83,4 +83,120 @@ static inline void h264_set_field(unsigned int *shadow, int field,
 	shadow[f->swreg] |= (value & mask) << f->lsb;
 }
 
+/* Raw register write (for whole-register fields like address LSB/MSB). */
+static inline void h264_set_raw(unsigned int *shadow, unsigned int swreg,
+                                unsigned int value)
+{
+	if (swreg < H264_REG_SHADOW_WORDS)
+		shadow[swreg] = value;
+}
+
+/* ---- DPB reference-frame registers (VC8000D, HW_ID 0x8001) ------------ */
+/* Extracted from 8170table.h:
+ *   REFERn_BASE_LSB  = swreg 67+2n, MSB = 66+2n  (n=0..15)
+ *   REFERn_NBR       = swreg 30+n/2, lsb = (n%2)*16, 16 bits (frame_num)
+ *   REFER_VALID_E    = swreg 39 (bit n = ref n valid)
+ *   REFER_LTERM_E    = swreg 38 (bit n = ref n long-term)
+ *   REFER0_TOPC_E    = swreg 67 lsb0, REFER0_FIELD_E = swreg 67 lsb1
+ *   REF0_POC0..6     = swreg 51 lsb20, 51 lsb10, 51 lsb0,
+ *                      52 lsb20, 52 lsb10, 52 lsb0, 53 lsb20 (10 bits each)
+ */
+
+/* Write reference frame luma base (64-bit addr split LSB/MSB). */
+static inline void h264_set_ref_base(unsigned int *shadow, int n,
+                                     unsigned long addr)
+{
+	h264_set_raw(shadow, 67 + 2 * n, (unsigned int)(addr & 0xffffffffu));
+	h264_set_raw(shadow, 66 + 2 * n, (unsigned int)((uint64_t)addr >> 32));
+}
+
+/* Write reference frame number (frame_num) into REFERn_NBR. */
+static inline void h264_set_ref_nbr(unsigned int *shadow, int n,
+                                    unsigned int frame_num)
+{
+	unsigned int swreg = 30 + n / 2;
+	unsigned int lsb = (n % 2) * 16;
+	unsigned int mask = 0xffffu;
+
+	shadow[swreg] &= ~(mask << lsb);
+	shadow[swreg] |= (frame_num & mask) << lsb;
+}
+
+/* Valid / long-term bitmasks. */
+static inline void h264_set_ref_valid(unsigned int *shadow, unsigned int mask)
+{
+	h264_set_raw(shadow, 39, mask);
+}
+static inline void h264_set_ref_longterm(unsigned int *shadow, unsigned int mask)
+{
+	h264_set_raw(shadow, 38, mask);
+}
+
+/* REF0 top-field / field-mode flags (swreg 67 bits 0/1). NOTE: these share
+ * the register with REFER0_BASE_LSB, so set only the flag bits, preserving
+ * the address that h264_set_ref_base() wrote. */
+static inline void h264_set_ref0_flags(unsigned int *shadow, int topc,
+                                       int field)
+{
+	if (topc)  shadow[67] |= 1u << 0;
+	if (field) shadow[67] |= 1u << 1;
+}
+
+/* REF0 POC table (7 entries of 10 bits). */
+static inline void h264_set_ref0_poc(unsigned int *shadow, int idx, int poc)
+{
+	static const unsigned int reg[7] = {51, 51, 51, 52, 52, 52, 53};
+	static const unsigned int lsb[7] = {20, 10, 0, 20, 10, 0, 20};
+	unsigned int mask = 0x3ffu;
+
+	if (idx < 0 || idx > 6)
+		return;
+	shadow[reg[idx]] &= ~(mask << lsb[idx]);
+	shadow[reg[idx]] |= ((unsigned int)poc & mask) << lsb[idx];
+}
+
+/* ---- Reference picture list registers (VC8000D) ----------------------- */
+/* Three list families, each 16 entries x 5 bits packed into registers:
+ *   INIT_RLIST_Fn : swreg {14,15,16,17,18,19}, lsb {0,10,20} per reg
+ *   INIT_RLIST_Bn : same regs, lsb {5,15,25}
+ *   PINIT_RLIST_Fn: swreg {47,10,11}, lsb {10,15,20,25} then {0,5,..25}
+ *   BINIT_RLIST_Fn: swreg {42,43,44,45,46,47}, lsb {0,10,20}
+ *   BINIT_RLIST_Bn: same regs, lsb {5,15,25}
+ * 'value' is the DPB slot index (0..15) or 0x1f for invalid.
+ */
+enum h264_rlist_kind { RLIST_PF, RLIST_PB, RLIST_BF, RLIST_BB };
+
+static inline void h264_set_ref_list(unsigned int *shadow,
+                                     enum h264_rlist_kind kind, int idx,
+                                     unsigned int value)
+{
+	unsigned int swreg, lsb;
+	unsigned int mask = 0x1fu;
+
+	if (idx < 0 || idx > 15)
+		return;
+	switch (kind) {
+	case RLIST_PF: /* INIT_RLIST_Fn */
+		swreg = 14 + idx / 3;
+		lsb = (idx % 3) * 10;
+		break;
+	case RLIST_PB: /* INIT_RLIST_Bn */
+		swreg = 14 + idx / 3;
+		lsb = 5 + (idx % 3) * 10;
+		break;
+	case RLIST_BF: /* BINIT_RLIST_Fn */
+		swreg = 42 + idx / 3;
+		lsb = (idx % 3) * 10;
+		break;
+	case RLIST_BB: /* BINIT_RLIST_Bn */
+		swreg = 42 + idx / 3;
+		lsb = 5 + (idx % 3) * 10;
+		break;
+	default:
+		return;
+	}
+	shadow[swreg] &= ~(mask << lsb);
+	shadow[swreg] |= (value & mask) << lsb;
+}
+
 #endif /* H264_REGS_H */

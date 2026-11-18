@@ -171,11 +171,65 @@ int vcmd_h264_build_decode_cmd(uint32_t *cmd, size_t cmd_words,
 		shadow[stream_base_msb.swreg] = (unsigned int)((uint64_t)prm->stream_mmu_addr >> 32);
 	}
 
-	/* TODO: DPB ref lists (swreg 84..99), POC table, CABAC init table,
-	 * scaling lists, chroma output base, RLC/MV working buffers. These need
-	 * the client's reconstructed reference surfaces (VAPictureH264[16]).
-	 * See H264RunAsic() in vc8000d software/source/h264high/h264hwd_asic.c.
-	 */
+	/* ---- DPB reference frames (mirrors H264RunAsic in the VC8000D SDK) ---- */
+	{
+		unsigned int valid_mask = 0, lterm_mask = 0;
+		int n;
+
+		for (n = 0; n < 16; n++) {
+			const struct h264_dpb_ref *r = &prm->dpb[n];
+
+			/* Every slot gets a base address; unused slots point at ref[0]
+			 * (SDK defensive default for erroneous streams). */
+			unsigned long base = r->valid ? r->luma_mmu_addr
+			                              : prm->dpb[0].luma_mmu_addr;
+			h264_set_ref_base(shadow, n, base);
+			h264_set_ref_nbr(shadow, n, r->frame_num);
+
+			if (r->valid) {
+				valid_mask |= 1u << (31 - n);  /* SDK bit order: 31-n */
+				if (r->long_term)
+					lterm_mask |= 1u << (31 - n);
+			}
+		}
+		h264_set_ref_valid(shadow, valid_mask);
+		h264_set_ref_longterm(shadow, lterm_mask);
+
+		/* REF0 flags: top-field-available + field-mode (shared swreg 67). */
+		if (prm->dpb[0].valid) {
+			h264_set_ref0_flags(shadow,
+			                    prm->dpb[0].poc_top != prm->dpb[0].poc_bottom,
+			                    prm->dpb[0].field_pic);
+			/* REF0 POC table: top, bottom, and derived values. */
+			h264_set_ref0_poc(shadow, 0, prm->dpb[0].poc_top);
+			h264_set_ref0_poc(shadow, 1, prm->dpb[0].poc_bottom);
+			h264_set_ref0_poc(shadow, 2, prm->frame_num);
+		}
+
+		/* Reference picture lists.
+		 * P.slice: INIT_RLIST_F (list0) + INIT_RLIST_B (list1).
+		 * B.slice: BINIT_RLIST_F (list0) + BINIT_RLIST_B (list1).
+		 * An invalid entry (0x1f) tells HW to ignore that slot. */
+		for (n = 0; n < 16; n++) {
+			unsigned int l0 = n < prm->refs.list0_count
+			                ? (prm->refs.list0[n] & 0x1f) : 0x1f;
+			unsigned int l1 = n < prm->refs.list1_count
+			                ? (prm->refs.list1[n] & 0x1f) : 0x1f;
+
+			if (prm->slice_type == 1 || prm->slice_type == 6) { /* B */
+				h264_set_ref_list(shadow, RLIST_BF, n, l0);
+				h264_set_ref_list(shadow, RLIST_BB, n, l1);
+			} else { /* P / I */
+				h264_set_ref_list(shadow, RLIST_PF, n, l0);
+				h264_set_ref_list(shadow, RLIST_PB, n, l1);
+			}
+		}
+	}
+
+	/* TODO: POC table for refs 1..15 (SDK writes them into a work buffer,
+	 * not registers — only REF0 has POC registers), CABAC init + scaling
+	 * lists, and chroma output base. Those need a POC work buffer allocated
+	 * like the surfaces; see h264PreparePOC() in the SDK. */
 
 	/* ---- kick off decode: set DEC_E in the SAME shadow so that other bits
 	 * in swreg1 (e.g. DEC_IRQ_DIS at lsb4) are preserved ---- */

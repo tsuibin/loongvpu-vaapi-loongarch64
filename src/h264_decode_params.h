@@ -9,6 +9,28 @@
  * VASliceParameterBufferH264 and passes them here, so vcmd.c stays
  * independent of <va/va.h>.
  */
+/* One DPB reference frame (maps to VAPictureH264 + its VPU surface). */
+struct h264_dpb_ref {
+	unsigned long luma_mmu_addr;    /* reconstructed luma base, VPU MMU addr */
+	unsigned long chroma_mmu_addr;  /* chroma base (high10/planar) */
+	uint32_t frame_num;             /* frame_idx from VAPictureH264 */
+	int32_t  poc_top;               /* TopFieldOrderCnt */
+	int32_t  poc_bottom;            /* BottomFieldOrderCnt */
+	uint8_t  valid;                 /* !(flags & VA_PICTURE_H264_INVALID) */
+	uint8_t  long_term;             /* flags & LONG_TERM_REFERENCE */
+	uint8_t  field_pic;             /* flags & (TOP_FIELD|BOTTOM_FIELD) */
+	uint8_t  top_field;             /* flags & TOP_FIELD */
+};
+
+/* Reference picture lists: each entry is a DPB slot index (0..15) or 0x1f
+ * for invalid, as VA-API clients encode RefPicList[].picture_id. */
+struct h264_ref_lists {
+	uint8_t list0[16];              /* forward / P list (RefPicList0) */
+	uint8_t list1[16];              /* backward / B list (RefPicList1) */
+	uint8_t list0_count;
+	uint8_t list1_count;
+};
+
 struct h264_decode_params {
 	/* from VAPictureParameterBufferH264 */
 	uint16_t pic_width_in_mbs_minus1;
@@ -54,6 +76,10 @@ struct h264_decode_params {
 	unsigned long output_chroma_mmu_addr; /* chroma plane (if planar) */
 	unsigned long rlc_vlc_mmu_addr;     /* RLC/VLC working buffer */
 	unsigned long mb_ctrl_mmu_addr;     /* MB control working buffer */
+
+	/* DPB reference frames and lists */
+	struct h264_dpb_ref dpb[16];
+	struct h264_ref_lists refs;
 };
 
 #endif /* H264_DECODE_PARAMS_H */

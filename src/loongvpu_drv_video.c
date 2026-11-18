@@ -584,6 +584,48 @@ static VAStatus loongvpu_EndPicture(VADriverContextP ctx, VAContextID context)
 		                  s->slice_type == 7) ? 1 : 0;
 		prm.dec_ref_pic_marking_bit_size = 16;   /* safe default */
 		prm.pic_order_cnt_bit_size = prm.log2_max_pic_order_cnt_lsb_minus4 + 4;
+
+		/* ---- DPB reference frames: VAPictureH264[16] -> VPU MMU addrs ---- */
+		{
+			int n;
+			for (n = 0; n < 16; n++) {
+				VAPictureH264 *ref = &p->ReferenceFrames[n];
+				struct h264_dpb_ref *d = &prm.dpb[n];
+				struct tracked_surface *surf;
+
+				d->frame_num = ref->frame_idx;
+				d->poc_top    = ref->TopFieldOrderCnt;
+				d->poc_bottom = ref->BottomFieldOrderCnt;
+				d->valid      = !(ref->flags & VA_PICTURE_H264_INVALID);
+				d->long_term  = !!(ref->flags & VA_PICTURE_H264_LONG_TERM_REFERENCE);
+				d->field_pic  = !!(ref->flags &
+				                   (VA_PICTURE_H264_TOP_FIELD |
+				                    VA_PICTURE_H264_BOTTOM_FIELD));
+				d->top_field  = !!(ref->flags & VA_PICTURE_H264_TOP_FIELD);
+
+				/* picture_id is the client's VASurfaceID for this DPB slot;
+				 * resolve it to the MMU-mapped VPU buffer. */
+				surf = d->valid ? find_surface(drv, ref->picture_id) : NULL;
+				d->luma_mmu_addr = surf ? vpu_buffer_mmu(surf->buf) : 0;
+			}
+
+			/* Reference picture lists -> DPB slot indices.  VA clients
+			 * encode the slot in picture_id (0..15); treat it directly. */
+			prm.refs.list0_count = 0;
+			for (n = 0; n < 16 && n < 32; n++) {
+				VAPictureH264 *r = &s->RefPicList0[n];
+				if (r->flags & VA_PICTURE_H264_INVALID) break;
+				prm.refs.list0[n] = (uint8_t)(r->picture_id & 0x1f);
+				prm.refs.list0_count++;
+			}
+			prm.refs.list1_count = 0;
+			for (n = 0; n < 16 && n < 32; n++) {
+				VAPictureH264 *r = &s->RefPicList1[n];
+				if (r->flags & VA_PICTURE_H264_INVALID) break;
+				prm.refs.list1[n] = (uint8_t)(r->picture_id & 0x1f);
+				prm.refs.list1_count++;
+			}
+		}
 	}
 
 	prm.output_mmu_addr = vpu_buffer_mmu(out->buf);

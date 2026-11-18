@@ -11,8 +11,12 @@ platforms).
 > auto-extracted from the open-source VC8000D SDK (8170table.h, HW_ID 0x8001
 > = Loongson LG200 VPU), and `vcmd_h264_build_decode_cmd()` programs the core
 > decode registers from VA-API SPS/PPS/slice params (dimensions, QP, CABAC,
-> frame numbers, buffer addresses, DEC_E). Working buffers and DPB reference
-> lists still need the client to supply reconstructed surfaces (see Roadmap).
+> frame numbers, buffer addresses, DEC_E) **and the DPB reference list**:
+> 16 reference frames (base addresses, frame numbers, valid/long-term masks,
+> REF0 POC) plus P/B reference lists, all mapped from VA-API
+> `VAPictureParameterBufferH264`. Remaining: POC for refs 1..15 (work buffer),
+> CABAC init / scaling-list tables, and DMA-BUF allocation for bitstream and
+> working buffers (see Roadmap).
 > Without a real LoongVPU device the driver soft-degrades to "decode disabled"
 > but still loads.
 
@@ -106,10 +110,14 @@ Remaining (the hard part):
    QP, CABAC, frame/POC, buffer addresses and DEC_E from VA-API params.
    Source: [alphagocc/vc8000d](https://github.com/alphagocc/vc8000d)
    `software/source/{common/8170table.h,h264high/h264hwd_asic.c}`.
-4. **Remaining H.264 work**: DPB reference lists (swreg 84..99), POC/CABAC
-   init/scale-list tables, and DMA-BUF allocation for bitstream + working
-   buffers (currently their MMU addresses are 0). Needs the client's
-   reconstructed reference surfaces. Follow `H264RunAsic()` in the SDK.
+4. **DPB reference list** — DONE. `h264_regs.h` has helpers for REFn_BASE
+   (swreg 66..97), REFn_NBR (30..37), VALID/LTERM (39/38), REF0 POC (51..53)
+   and the INIT/PINIT/BINIT reference list families. `vaEndPicture` maps
+   `VAPictureH264[16]` and `RefPicList0/1` into these registers.
+5. **Remaining H.264 work**: POC table for refs 1..15 (SDK writes these into a
+   work buffer via `h264PreparePOC`, not registers), CABAC init + scaling-list
+   tables, and DMA-BUF allocation for bitstream/working buffers (their MMU
+   addresses are currently 0). Needs `h264PreparePOC()`-style work buffer.
 6. **Per-codec support**: extend the same approach to H.265, then AV1.
 7. **Encode path**: `VAEntrypointEncSlice` via `HANTROENC_IOC*` ioctls.
 8. **Browser integration**: even with a working driver, the AOSC advisory notes
