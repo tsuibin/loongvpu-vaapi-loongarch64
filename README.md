@@ -114,13 +114,20 @@ Remaining (the hard part):
    (swreg 66..97), REFn_NBR (30..37), VALID/LTERM (39/38), REF0 POC (51..53)
    and the INIT/PINIT/BINIT reference list families. `vaEndPicture` maps
    `VAPictureH264[16]` and `RefPicList0/1` into these registers.
-5. **Remaining H.264 work**: POC table for refs 1..15 (SDK writes these into a
-   work buffer via `h264PreparePOC`, not registers), CABAC init + scaling-list
-   tables, and DMA-BUF allocation for bitstream/working buffers (their MMU
-   addresses are currently 0). Needs `h264PreparePOC()`-style work buffer.
-6. **Per-codec support**: extend the same approach to H.265, then AV1.
-7. **Encode path**: `VAEntrypointEncSlice` via `HANTROENC_IOC*` ioctls.
-8. **Browser integration**: even with a working driver, the AOSC advisory notes
+5. **Bitstream + work buffer DMA-BUFs** — DONE. `VASliceDataBufferType`
+   buffers are backed by a GEM/DMA-BUF + MMU map (`alloc_tracked_buffer`),
+   so the VCMD stream-base (swreg 20/21) uses a real address. Decoder work
+   buffers (RLC/VLC incl. CABAC/scaling/POC, and MB control) are allocated
+   lazily and sized from the frame's macroblock count per the SDK constants
+   (`ensure_work_buffers`), wired to swreg 168/169 and 171. Graceful fallback
+   to host memory when no render node is present.
+6. **Remaining H.264 work**: POC table for refs 1..15 and CABAC/scaling-list
+   contents are still not *populated* in the work buffer (only the buffers
+   exist). `h264PreparePOC()` in the SDK writes POC data into a work buffer;
+   that data must be filled before the VPU can decode B-frames correctly.
+7. **Per-codec support**: extend the same approach to H.265, then AV1.
+8. **Encode path**: `VAEntrypointEncSlice` via `HANTROENC_IOC*` ioctls.
+9. **Browser integration**: even with a working driver, the AOSC advisory notes
    Chromium currently fails to use VA-API on this VPU; mpv/GStreamer are easier
    early test targets.
 

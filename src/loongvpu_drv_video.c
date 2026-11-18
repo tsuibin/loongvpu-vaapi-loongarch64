@@ -44,13 +44,16 @@ struct tracked_surface {
 	int               in_use;
 };
 
-/* One tracked VA buffer (slice data / params). */
+/* One tracked VA buffer (slice data / params).  Buffers that the VPU reads
+ * directly (bitstream) also own a GEM/DMA-BUF + MMU mapping; vpu_buf is NULL
+ * for host-only parameter buffers. */
 struct tracked_buffer {
 	VABufferID id;
 	VABufferType type;
-	void       *data;
+	void       *data;          /* CPU pointer (vpu_buffer vaddr when vpu_buf) */
 	size_t      size;
 	int         in_use;
+	struct vpu_buffer *vpu_buf; /* non-NULL for VPU-visible buffers */
 };
 
 /* Driver-private data, reachable via ctx->pDriverData. */
@@ -66,6 +69,11 @@ struct loongvpu_driver_data {
 	struct tracked_buffer  buffers[MAX_BUFFERS];
 	VASurfaceID            current_target;       /* from vaBeginPicture */
 	uint32_t               cmd[VCMD_CMD_WORDS];  /* scratch command buffer */
+
+	/* Decoder work buffers (allocated lazily on first decode). */
+	struct vpu_buffer *rlc_vlc_work;   /* RLC/VLC + CABAC/POC work area */
+	struct vpu_buffer *mb_ctrl_work;   /* MB control work area */
+	unsigned int       work_mbs;       /* macroblock count work was sized for */
 };
 
 /* ------------------------------------------------------------------------- */
@@ -124,12 +132,29 @@ static void loongvpu_drm_fini(struct loongvpu_driver_data *drv)
 		}
 	}
 
-	/* Free all tracked VA buffers. */
+	/* Free all tracked VA buffers.  Buffers with a VPU mapping are freed
+	 * through vpu_buffer_free (which unmaps + closes GEM); host-only
+	 * parameter buffers use plain free(). */
 	for (i = 0; i < MAX_BUFFERS; i++) {
 		if (drv->buffers[i].in_use) {
-			free(drv->buffers[i].data);
+			if (drv->buffers[i].vpu_buf)
+				vpu_buffer_free(drv->buffers[i].vpu_buf);
+			else
+				free(drv->buffers[i].data);
+			drv->buffers[i].vpu_buf = NULL;
+			drv->buffers[i].data = NULL;
 			drv->buffers[i].in_use = 0;
 		}
+	}
+
+	/* Free decoder work buffers. */
+	if (drv->rlc_vlc_work) {
+		vpu_buffer_free(drv->rlc_vlc_work);
+		drv->rlc_vlc_work = NULL;
+	}
+	if (drv->mb_ctrl_work) {
+		vpu_buffer_free(drv->mb_ctrl_work);
+		drv->mb_ctrl_work = NULL;
 	}
 
 	if (drv->vcmd) {
@@ -418,6 +443,33 @@ static VAStatus loongvpu_DestroyContext(VADriverContextP ctx, VAContextID contex
 	return VA_STATUS_SUCCESS;
 }
 
+/* Slice data is read directly by the VPU: back it with a GEM/DMA-BUF and
+ * map it into the VPU MMU.  If the render node is unavailable (build machine
+ * or non-LoongGPU), fall back to host memory so libva still functions. */
+static VAStatus alloc_tracked_buffer(struct loongvpu_driver_data *drv,
+                                     struct tracked_buffer *b,
+                                     size_t total, void *data)
+{
+	if (b->type == VASliceDataBufferType && drv->drm_fd >= 0) {
+		struct vpu_buffer *vb = vpu_buffer_alloc_bytes(drv->drm_fd, total);
+		if (vb && vpu_buffer_mmu_map(vb, 0) == 0) {
+			b->vpu_buf = vb;
+			b->data = vpu_buffer_vaddr(vb);
+		} else {
+			if (vb) vpu_buffer_free(vb);
+			vb = NULL;
+		}
+	}
+	if (!b->data) {
+		b->data = calloc(1, total ? total : 1);
+		if (!b->data)
+			return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	}
+	if (data && total)
+		memcpy(b->data, data, total);
+	return VA_STATUS_SUCCESS;
+}
+
 static VAStatus loongvpu_CreateBuffer(
 	VADriverContextP ctx, VAContextID context, VABufferType type,
 	unsigned int size, unsigned int num_elements, void *data,
@@ -426,6 +478,7 @@ static VAStatus loongvpu_CreateBuffer(
 	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
 	struct tracked_buffer *b = NULL;
 	size_t total = (size_t)size * (num_elements ? num_elements : 1);
+	VAStatus st;
 	int i;
 
 	(void)context;
@@ -437,11 +490,10 @@ static VAStatus loongvpu_CreateBuffer(
 	if (!b)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
-	b->data = calloc(1, total ? total : 1);
-	if (!b->data)
-		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-	if (data && total)
-		memcpy(b->data, data, total);
+	memset(b, 0, sizeof(*b));
+	st = alloc_tracked_buffer(drv, b, total, data);
+	if (st != VA_STATUS_SUCCESS)
+		return st;
 
 	b->id     = (VABufferID)next_id(drv);
 	b->type   = type;
@@ -481,7 +533,13 @@ static VAStatus loongvpu_DestroyBuffer(VADriverContextP ctx, VABufferID buffer_i
 	b = find_buffer(drv, buffer_id);
 	if (!b)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
-	free(b->data);
+	if (b->vpu_buf) {
+		vpu_buffer_free(b->vpu_buf);
+		b->vpu_buf = NULL;
+	} else {
+		free(b->data);
+	}
+	b->data = NULL;
 	b->in_use = 0;
 	return VA_STATUS_SUCCESS;
 }
@@ -509,6 +567,50 @@ static VAStatus loongvpu_RenderPicture(
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
 	/* Buffers are now stored in the tracked table; EndPicture consumes
 	 * the first VASliceDataBufferType as the bitstream. */
+	return VA_STATUS_SUCCESS;
+}
+
+/* Lazy work-buffer allocator. Sizes follow the VC8000D SDK H264 ASIC buffer
+ * requirements (h264hwd_asic.h): RLC/VLC = 880 bytes/MB plus CABAC init
+ * (3680), scaling lists (224) and POC (136); MB control = 8 bytes/MB. Buffers
+ * are (re)allocated when the frame's macroblock count grows. */
+static VAStatus ensure_work_buffers(struct loongvpu_driver_data *drv,
+                                    unsigned int mbs)
+{
+	size_t rlc_size, mb_size;
+
+	if (mbs == 0)
+		mbs = 1;
+	if (drv->rlc_vlc_work && mbs <= drv->work_mbs)
+		return VA_STATUS_SUCCESS;
+
+	if (drv->rlc_vlc_work) vpu_buffer_free(drv->rlc_vlc_work);
+	if (drv->mb_ctrl_work) vpu_buffer_free(drv->mb_ctrl_work);
+	drv->rlc_vlc_work = NULL;
+	drv->mb_ctrl_work = NULL;
+
+	rlc_size = (size_t)880 * mbs + 3680 + 224 + 136;
+	mb_size  = (size_t)8 * mbs;
+
+	if (drv->drm_fd >= 0) {
+		drv->rlc_vlc_work = vpu_buffer_alloc_bytes(drv->drm_fd, rlc_size);
+		drv->mb_ctrl_work = vpu_buffer_alloc_bytes(drv->drm_fd, mb_size);
+		if (drv->rlc_vlc_work)
+			vpu_buffer_mmu_map(drv->rlc_vlc_work, 0);
+		if (drv->mb_ctrl_work)
+			vpu_buffer_mmu_map(drv->mb_ctrl_work, 0);
+	}
+	if (!drv->rlc_vlc_work || !drv->mb_ctrl_work) {
+		/* No render node: decode is not possible, but keep the driver
+		 * loadable. EndPicture will fall back to zero addresses. */
+		fprintf(stderr, "loongvpu: work buffers unavailable (no VPU)\n");
+		if (drv->rlc_vlc_work) vpu_buffer_free(drv->rlc_vlc_work);
+		if (drv->mb_ctrl_work) vpu_buffer_free(drv->mb_ctrl_work);
+		drv->rlc_vlc_work = NULL;
+		drv->mb_ctrl_work = NULL;
+		return VA_STATUS_SUCCESS;
+	}
+	drv->work_mbs = mbs;
 	return VA_STATUS_SUCCESS;
 }
 
@@ -630,15 +732,21 @@ static VAStatus loongvpu_EndPicture(VADriverContextP ctx, VAContextID context)
 
 	prm.output_mmu_addr = vpu_buffer_mmu(out->buf);
 
-	/* TODO: bitstream + working buffers (RLC/VLC, MB ctrl) must be
-	 * allocated as DMA-BUFs and MMU-mapped like surfaces, then their VPU
-	 * addresses stored on the tracked_buffer. Until then the stream base
-	 * is 0 and the VPU would fault — this needs the client to route those
-	 * buffers through vpu_buffer_alloc()/mmu_map(). */
-	prm.stream_mmu_addr  = 0;
-	prm.rlc_vlc_mmu_addr = 0;
-	prm.mb_ctrl_mmu_addr = 0;
-	(void)bsbuf;
+	/* Bitstream: VA slice-data buffer now owns a GEM/DMA-BUF mapped into
+	 * the VPU MMU (see alloc_tracked_buffer). Use its real VPU address. */
+	prm.stream_mmu_addr = (bsbuf && bsbuf->vpu_buf)
+	                    ? vpu_buffer_mmu(bsbuf->vpu_buf) : 0;
+
+	/* Decoder work buffers (RLC/VLC + MB control), sized from picture MBs. */
+	{
+		unsigned int mbs = ((unsigned int)prm.pic_width_in_mbs_minus1 + 1) *
+		                   ((unsigned int)prm.pic_height_in_mbs_minus1 + 1);
+		ensure_work_buffers(drv, mbs);
+	}
+	prm.rlc_vlc_mmu_addr = drv->rlc_vlc_work
+	                     ? vpu_buffer_mmu(drv->rlc_vlc_work) : 0;
+	prm.mb_ctrl_mmu_addr = drv->mb_ctrl_work
+	                     ? vpu_buffer_mmu(drv->mb_ctrl_work) : 0;
 
 	words = vcmd_h264_build_decode_cmd(drv->cmd, VCMD_CMD_WORDS, &prm);
 	if (words < 0)

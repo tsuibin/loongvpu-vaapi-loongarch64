@@ -114,6 +114,13 @@ err_free:
 	return NULL;
 }
 
+/* Allocate a byte-sized buffer. GEM dumb create rounds pitch up, so we ask
+ * for width=bytes, height=1, bpp=8; the resulting size is >= bytes. */
+struct vpu_buffer *vpu_buffer_alloc_bytes(int drm_fd, size_t bytes)
+{
+	return vpu_buffer_alloc(drm_fd, bytes ? bytes : 1, 1, 8);
+}
+
 /* ---------------- MMU mapping ------------------------------------------ */
 
 int vpu_buffer_mmu_map(struct vpu_buffer *buf, unsigned int slice)

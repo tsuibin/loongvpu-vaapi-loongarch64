@@ -10,6 +10,10 @@ struct vpu_buffer;
 struct vpu_buffer *vpu_buffer_alloc(int drm_fd, size_t width, size_t height,
                                     unsigned int bpp);
 
+/* Allocate a raw byte-sized GEM buffer (>= bytes) and mmap it. Useful for
+ * decoder work buffers (RLC/VLC, MB control) that have no width/height. */
+struct vpu_buffer *vpu_buffer_alloc_bytes(int drm_fd, size_t bytes);
+
 /* Map / unmap the buffer into the VPU MMU for the given slice. */
 int vpu_buffer_mmu_map(struct vpu_buffer *buf, unsigned int slice);
 int vpu_buffer_mmu_unmap(struct vpu_buffer *buf);

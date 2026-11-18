@@ -180,6 +180,35 @@ static int test_h264_dpb_stream(void)
 	return 0;
 }
 
+static int test_work_addresses(void)
+{
+	uint32_t cmd[256];
+	struct h264_decode_params prm;
+	int words, i, found_stream = 0, found_rlc = 0, found_mbc = 0;
+
+	memset(&prm, 0, sizeof(prm));
+	prm.pic_width_in_mbs_minus1 = 119;
+	prm.pic_height_in_mbs_minus1 = 67;
+	prm.stream_mmu_addr  = 0x0000000011000000ULL;
+	prm.rlc_vlc_mmu_addr = 0x0000000022000000ULL;
+	prm.mb_ctrl_mmu_addr = 0x0000000033000000ULL;
+
+	words = vcmd_h264_build_decode_cmd(cmd, 256, &prm);
+	if (words < 10) return 1;
+
+	for (i = 0; i + 1 < words; i += 2) {
+		uint32_t off = cmd[i] & 0xffffu;
+		uint32_t val = cmd[i + 1];
+		if (off == 20 * 4 && val == 0x11000000u) found_stream = 1;
+		if (off == (uint32_t)h264_fields[F_RLC_VLC_BASE_LSB].swreg * 4 &&
+		    val == 0x22000000u) found_rlc = 1;
+		if (off == (uint32_t)h264_fields[F_MB_CTRL_BASE_LSB].swreg * 4 &&
+		    val == 0x33000000u) found_mbc = 1;
+	}
+	if (!found_stream || !found_rlc || !found_mbc) return 1;
+	return 0;
+}
+
 int main(void)
 {
 	if (test_opcodes())   { fprintf(stderr, "FAIL: opcodes\n"); return 1; }
@@ -187,6 +216,7 @@ int main(void)
 	if (test_h264_stream()) { fprintf(stderr, "FAIL: h264 stream\n"); return 1; }
 	if (test_dpb()) { fprintf(stderr, "FAIL: dpb registers\n"); return 1; }
 	if (test_h264_dpb_stream()) { fprintf(stderr, "FAIL: h264 dpb stream\n"); return 1; }
-	printf("cmd_test PASSED (opcodes + masking + H.264 stream + DPB registers + DPB stream)\n");
+	if (test_work_addresses()) { fprintf(stderr, "FAIL: work addresses\n"); return 1; }
+	printf("cmd_test PASSED (opcodes + masking + H.264 + DPB + work addresses)\n");
 	return 0;
 }
