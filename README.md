@@ -4,14 +4,17 @@ An **open-source VA-API driver scaffold** for the Loongson **LoongVPU** video
 processing unit (found in 2K3000 / 3B6000M SoCs, including the LG200-based
 platforms).
 
-> **Status: working skeleton with H.264 submission path implemented.** The
-> driver now allocates real GEM/DMA buffers, maps them into the VPU MMU, and
-> drives the full VCMD reserve → link/run → wait → release submission flow for
-> H.264 decode. The **concrete H.264 register sequence** (SPS/PPS/slice → VCD
-> register writes) is still a structural skeleton: those values live in the
-> closed-source DWL / chip manual and are not in the open kernel tree (see
-> Roadmap). Without a real LoongVPU device the driver soft-degrades to
-> "decode disabled" but still loads.
+> **Status: H.264 register programming implemented from an open VC8000D SDK.**
+> The driver allocates real GEM/DMA buffers, maps them into the VPU MMU, and
+> drives the full VCMD reserve → link/run → wait → release submission flow.
+> The H.264 register sequence is now **real, not a stub**: `h264_regs.h` is
+> auto-extracted from the open-source VC8000D SDK (8170table.h, HW_ID 0x8001
+> = Loongson LG200 VPU), and `vcmd_h264_build_decode_cmd()` programs the core
+> decode registers from VA-API SPS/PPS/slice params (dimensions, QP, CABAC,
+> frame numbers, buffer addresses, DEC_E). Working buffers and DPB reference
+> lists still need the client to supply reconstructed surfaces (see Roadmap).
+> Without a real LoongVPU device the driver soft-degrades to "decode disabled"
+> but still loads.
 
 ## Why this exists
 
@@ -98,21 +101,24 @@ Done:
 
 Remaining (the hard part):
 
-3. **H.264 register sequence** — `vcmd_h264_build_decode_cmd()` is currently a
-   structural skeleton. Parsing SPS/PPS/slice headers and emitting the exact
-   VCD register writes (stream base/length, dimensions, DPB, ref lists, POC,
-   CABAC flags, output base, DEC_E start) requires the VeriSilicon/Loongson
-   chip manual or the closed DWL. This is the real blocker to a decoded image,
-   not the ioctl plumbing.
-4. **Per-codec support**: fill in H.264, then H.265, then AV1.
-5. **Encode path**: `VAEntrypointEncSlice` via `HANTROENC_IOC*` ioctls.
-6. **Browser integration**: even with a working driver, the AOSC advisory notes
+3. **H.264 register sequence (core)** — DONE. `h264_regs.h` holds the real
+   VC8000D register map; `vcmd_h264_build_decode_cmd()` programs dimensions,
+   QP, CABAC, frame/POC, buffer addresses and DEC_E from VA-API params.
+   Source: [alphagocc/vc8000d](https://github.com/alphagocc/vc8000d)
+   `software/source/{common/8170table.h,h264high/h264hwd_asic.c}`.
+4. **Remaining H.264 work**: DPB reference lists (swreg 84..99), POC/CABAC
+   init/scale-list tables, and DMA-BUF allocation for bitstream + working
+   buffers (currently their MMU addresses are 0). Needs the client's
+   reconstructed reference surfaces. Follow `H264RunAsic()` in the SDK.
+6. **Per-codec support**: extend the same approach to H.265, then AV1.
+7. **Encode path**: `VAEntrypointEncSlice` via `HANTROENC_IOC*` ioctls.
+8. **Browser integration**: even with a working driver, the AOSC advisory notes
    Chromium currently fails to use VA-API on this VPU; mpv/GStreamer are easier
    early test targets.
 
 ### Alternative: CPU-side decode optimization
-If the VPU register manual is unavailable, the other route is software H.264
-decode accelerated by LoongArch LSX/LASX SIMD intrinsics. Reference:
+Independent of the VPU, software H.264 decode can be accelerated with
+LoongArch LSX/LASX SIMD intrinsics. Reference:
 [unofficial-loongarch-intrinsics-guide (lg200_wip)](https://github.com/phorcys/unofficial-loongarch-intrinsics-guide/tree/lg200_wip).
 That path bypasses the VPU entirely (FFmpeg/libavcodec + LSX) and is a separate
 project from this VA-API driver.
@@ -125,11 +131,19 @@ project from this VA-API driver.
 
 ## License
 
-MIT for this scaffold. The upstream LoongVPU kernel driver is GPL-2.0; when
-porting code from it, preserve its GPL license and keep it in separate files.
+MIT for this scaffold. The upstream LoongVPU kernel driver is GPL-2.0 and the
+VC8000D SDK is BSD-3-Clause; `h264_regs.h` contains only factual register
+offsets/bit-widths extracted from the SDK's generated table (data, not
+copyrightable expression). If you copy algorithmic code (e.g. H264RunAsic
+logic) from those projects, keep their respective licenses in separate files.
 
 ## References
 
 - AOSC announcement: https://aosc.io/news/2025-12-31-loonggpu-and-loongvpu-preview
 - Kernel ABI source: https://github.com/AOSC-Tracking/loongvpu-kernel-dkms
+- **VC8000D open SDK (H.264 register map + H264RunAsic)**: https://github.com/alphagocc/vc8000d
+  — `software/source/common/8170table.h`, `software/source/common/regdrv.c`,
+  `software/source/h264high/h264hwd_asic.c`, `software/linux/vcmd_pcidriver/`
+- mainline Linux Hantro H.264 reference: `drivers/media/platform/verisilicon/hantro_g1_h264_dec.c`
+- LoongArch SIMD intrinsics: https://github.com/phorcys/unofficial-loongarch-intrinsics-guide/tree/lg200_wip
 - libva: https://github.com/intel/libva

@@ -27,6 +27,7 @@
 #include "loongvpu_abi.h"
 #include "vpu_buffer.h"
 #include "vcmd.h"
+#include "h264_decode_params.h"
 
 #define LOONGVPU_DRIVER_NAME   "LoongVPU (open-source scaffold)"
 #define LOONGVPU_VENDOR        "loongvpu-vaapi"
@@ -515,7 +516,8 @@ static VAStatus loongvpu_EndPicture(VADriverContextP ctx, VAContextID context)
 {
 	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
 	struct tracked_surface *out;
-	struct tracked_buffer *bs = NULL;
+	struct h264_decode_params prm;
+	struct tracked_buffer *pic = NULL, *slice = NULL, *bsbuf = NULL;
 	int i, words;
 
 	(void)context;
@@ -526,23 +528,77 @@ static VAStatus loongvpu_EndPicture(VADriverContextP ctx, VAContextID context)
 	if (!out)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 
-	/* Pick the first slice-data buffer (or any buffer with data) as bitstream. */
+	/* Collect the H.264 VA buffers by type. */
 	for (i = 0; i < MAX_BUFFERS; i++) {
-		if (drv->buffers[i].in_use &&
-		    drv->buffers[i].type == VASliceDataBufferType) {
-			bs = &drv->buffers[i];
-			break;
-		}
+		struct tracked_buffer *b = &drv->buffers[i];
+		if (!b->in_use)
+			continue;
+		if (b->type == VAPictureParameterBufferType && !pic)
+			pic = b;
+		else if (b->type == VASliceParameterBufferType && !slice)
+			slice = b;
+		else if (b->type == VASliceDataBufferType && !bsbuf)
+			bsbuf = b;
 	}
-	if (!bs) {
-		for (i = 0; i < MAX_BUFFERS; i++)
-			if (drv->buffers[i].in_use) { bs = &drv->buffers[i]; break; }
+	if (!pic || !slice)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+	/* ---- map VA-API params -> VC8000D register params ---- */
+	memset(&prm, 0, sizeof(prm));
+	{
+		VAPictureParameterBufferH264 *p = pic->data;
+		VASliceParameterBufferH264   *s = slice->data;
+
+		prm.pic_width_in_mbs_minus1  = p->picture_width_in_mbs_minus1;
+		prm.pic_height_in_mbs_minus1 = p->picture_height_in_mbs_minus1;
+		prm.num_ref_frames           = p->num_ref_frames;
+		prm.bit_depth_luma_minus8    = p->bit_depth_luma_minus8;
+		prm.bit_depth_chroma_minus8  = p->bit_depth_chroma_minus8;
+		prm.pic_init_qp_minus26      = p->pic_init_qp_minus26;
+		prm.chroma_qp_index_offset   = p->chroma_qp_index_offset;
+		prm.second_chroma_qp_index_offset = p->second_chroma_qp_index_offset;
+		prm.frame_num                = p->frame_num;
+
+		prm.chroma_format_idc             = p->seq_fields.bits.chroma_format_idc;
+		prm.frame_mbs_only_flag           = p->seq_fields.bits.frame_mbs_only_flag;
+		prm.mb_adaptive_frame_field_flag  = p->seq_fields.bits.mb_adaptive_frame_field_flag;
+		prm.direct_8x8_inference_flag     = p->seq_fields.bits.direct_8x8_inference_flag;
+		prm.log2_max_frame_num_minus4     = p->seq_fields.bits.log2_max_frame_num_minus4;
+		prm.pic_order_cnt_type            = p->seq_fields.bits.pic_order_cnt_type;
+		prm.log2_max_pic_order_cnt_lsb_minus4 = p->seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4;
+
+		prm.entropy_coding_mode_flag      = p->pic_fields.bits.entropy_coding_mode_flag;
+		prm.field_pic_flag                = p->pic_fields.bits.field_pic_flag;
+		prm.reference_pic_flag            = p->pic_fields.bits.reference_pic_flag;
+		prm.constrained_intra_pred_flag   = p->pic_fields.bits.constrained_intra_pred_flag;
+
+		prm.slice_data_size       = s->slice_data_size;
+		prm.slice_data_bit_offset = s->slice_data_bit_offset;
+		prm.first_mb_in_slice     = s->first_mb_in_slice;
+		prm.slice_type            = s->slice_type;
+		prm.num_ref_idx_l0_active_minus1 = s->num_ref_idx_l0_active_minus1;
+		prm.num_ref_idx_l1_active_minus1 = s->num_ref_idx_l1_active_minus1;
+
+		/* infer IDR / bit lengths conservatively from flags */
+		prm.idr_pic_id = (p->pic_fields.bits.reference_pic_flag &&
+		                  s->slice_type == 7) ? 1 : 0;
+		prm.dec_ref_pic_marking_bit_size = 16;   /* safe default */
+		prm.pic_order_cnt_bit_size = prm.log2_max_pic_order_cnt_lsb_minus4 + 4;
 	}
 
-	words = vcmd_h264_build_decode_cmd(
-		drv->cmd, VCMD_CMD_WORDS,
-		bs ? bs->data : NULL, bs ? bs->size : 0,
-		vpu_buffer_mmu(out->buf), vpu_buffer_id(out->buf));
+	prm.output_mmu_addr = vpu_buffer_mmu(out->buf);
+
+	/* TODO: bitstream + working buffers (RLC/VLC, MB ctrl) must be
+	 * allocated as DMA-BUFs and MMU-mapped like surfaces, then their VPU
+	 * addresses stored on the tracked_buffer. Until then the stream base
+	 * is 0 and the VPU would fault — this needs the client to route those
+	 * buffers through vpu_buffer_alloc()/mmu_map(). */
+	prm.stream_mmu_addr  = 0;
+	prm.rlc_vlc_mmu_addr = 0;
+	prm.mb_ctrl_mmu_addr = 0;
+	(void)bsbuf;
+
+	words = vcmd_h264_build_decode_cmd(drv->cmd, VCMD_CMD_WORDS, &prm);
 	if (words < 0)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 

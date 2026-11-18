@@ -33,14 +33,10 @@
 
 #include "loongvpu_abi.h"
 #include "vcmd.h"
+#include "h264_regs.h"
+#include "h264_decode_params.h"
 
-/* Known register offsets from dwl_defs.h (open source, GPL). */
-#define HANTRODEC_HW_ID_OFF         (0   * 4)
-#define HANTRODEC_SYNTH_CFG_OFF     (50  * 4)
-#define HANTRODEC_CFG_STAT_OFF      (23  * 4)
-#define HANTRODEC_IRQ_STAT_OFF      (1   * 4)
-#define HANTRO_DEC_E                0x01
-#define DWL_H264_E_BIT              24   /* DWL_H264_E is 2 bits @24 */
+/* Register map is in h264_regs.h (auto-extracted from VC8000D SDK). */
 
 struct vpu_vcmd {
 	int                        drm_fd;
@@ -97,48 +93,102 @@ struct vpu_vcmd *vpu_vcmd_open(int drm_fd)
 
 /* ---------------- H.264 decode command builder ------------------------- */
 /*
- * STUB / STRUCTURAL SKELETON.
+ * Program the VC8000D H.264 decoder registers from VA-API params and emit
+ * them as a VCMD OPCODE_WREG stream.
  *
- * 'bs' is a caller-provided undecoded H.264 access unit; 'out_mmu' is the
- * MMU-mapped address of the output surface (from vpu_buffer_mmu_map()).
+ * Register map (h264_regs.h) is auto-extracted from the open VC8000D SDK
+ * (8170table.h, HW_ID 0x8001 = Loongson LG200 VPU). The field programming
+ * order follows H264RunAsic() in the same SDK and the mainline Linux
+ * hantro_g1_h264_dec.c reference.
  *
- * A real implementation must parse SPS/PPS/slice headers and emit the exact
- * VCD register sequence (stream base/length, frame dimensions, DPB refs,
- * pic order cnt, cabac flags, output base, DEC_E start bit...). Those values
- * are chip-specific and unavailable in the open tree; this skeleton emits a
- * minimal, well-formed command stream that exercises the same ioctl path.
+ * NOTE: this covers the core decode configuration. The full SDK also sets
+ * DPB reference lists, POC and CABAC/scale-list tables; those need the
+ * reconstructed DPB surfaces from the client and are marked TODO below.
+ * This is a functional base, not a complete multi-reference decoder yet.
  *
  * Returns number of uint32 words written, or negative on error.
  */
 int vcmd_h264_build_decode_cmd(uint32_t *cmd, size_t cmd_words,
-                               const void *bs, size_t bs_size,
-                               unsigned long out_mmu, unsigned int out_id)
+                               const struct h264_decode_params *prm)
 {
+	unsigned int shadow[H264_REG_SHADOW_WORDS] = {0};
 	uint32_t *p = cmd;
 	uint32_t *end = cmd + cmd_words;
-	const unsigned char *stream = (const unsigned char *)bs;
+	int i;
 
-	(void)stream; (void)bs_size; (void)out_id;
-
-	if (!cmd || cmd_words < 16)
+	if (!cmd || !prm || cmd_words < 64)
 		return -1;
 
-	/* ---- structural skeleton: identify + configure ---- */
-	/* Read HW id/config (harmless, validates the register path). */
-	vcmd_cmd_wreg(&p, HANTRODEC_HW_ID_OFF, 0);         /* trigger read */
-	if (p >= end) return -1;
+	/* ---- core decoder control (mirrors H264RunAsic / G1 set_params) ---- */
+	h264_set_field(shadow, F_DEC_MODE, DEC_X170_MODE_H264);   /* H.264 mode */
 
-	/*
-	 * TODO (chip manual required):
-	 *   - write H.264 stream base address / length
-	 *   - write picture width/height, profile, DPB base, ref lists
-	 *   - write output (MMU) address: out_mmu
-	 *   - set DEC_E (HANTRO_DEC_E) to start decode
-	 * Example placeholder writes using known bit positions:
+	/* Picture dimensions in macroblocks. */
+	h264_set_field(shadow, F_PIC_MB_WIDTH,  prm->pic_width_in_mbs_minus1 + 1);
+	h264_set_field(shadow, F_PIC_MB_HEIGHT, prm->pic_height_in_mbs_minus1 + 1);
+	h264_set_field(shadow, F_REF_FRAMES,    prm->num_ref_frames);
+
+	/* Bitstream start: slice_data_bit_offset (bits into NAL) + stream length. */
+	h264_set_field(shadow, F_STRM_START_BIT, prm->slice_data_bit_offset);
+	h264_set_field(shadow, F_STREAM_LEN,     prm->slice_data_size);
+
+	/* Quantization. */
+	h264_set_field(shadow, F_INIT_QP,       (unsigned int)(prm->pic_init_qp_minus26 + 26));
+	h264_set_field(shadow, F_CH_QP_OFFSET,  (unsigned int)(prm->chroma_qp_index_offset & 0x1f));
+	h264_set_field(shadow, F_CH_QP_OFFSET2, (unsigned int)(prm->second_chroma_qp_index_offset & 0x1f));
+
+	/* Frame numbering / POC. */
+	h264_set_field(shadow, F_FRAMENUM_LEN, prm->log2_max_frame_num_minus4 + 4);
+	h264_set_field(shadow, F_FRAMENUM,     prm->frame_num);
+	h264_set_field(shadow, F_POC_LENGTH,   prm->log2_max_pic_order_cnt_lsb_minus4 + 4);
+	h264_set_field(shadow, F_IDR_PIC_ID,   prm->idr_pic_id);
+	h264_set_field(shadow, F_REFPIC_MK_LEN, prm->dec_ref_pic_marking_bit_size);
+
+	/* Flags from SPS/PPS/slice. */
+	h264_set_field(shadow, F_CABAC_E,           prm->entropy_coding_mode_flag);
+	h264_set_field(shadow, F_DIR_8X8_INFER_E,   prm->direct_8x8_inference_flag);
+	h264_set_field(shadow, F_PIC_INTERLACE_E,   !prm->frame_mbs_only_flag &&
+	                                            prm->mb_adaptive_frame_field_flag);
+	h264_set_field(shadow, F_PIC_FIELDMODE_E,   prm->field_pic_flag);
+	h264_set_field(shadow, F_WRITE_MVS_E,       prm->reference_pic_flag);
+	h264_set_field(shadow, F_FILTERING_DIS,     !prm->constrained_intra_pred_flag ? 0 : 0);
+	h264_set_field(shadow, F_START_CODE_E,      1);   /* start-code emulation on */
+	h264_set_field(shadow, F_DEC_CLK_GATE_E,    1);
+	h264_set_field(shadow, F_DEC_IRQ_DIS,       1);   /* VCMD uses polling/IRQ via arbiter */
+	h264_set_field(shadow, F_APF_THRESHOLD,     8);
+
+	/* ---- buffer addresses (64-bit split into LSB/MSB registers) ---- */
+	h264_set_field(shadow, F_RLC_VLC_BASE_LSB, (unsigned int)(prm->rlc_vlc_mmu_addr & 0xffffffffu));
+	h264_set_field(shadow, F_RLC_VLC_BASE_MSB, (unsigned int)((uint64_t)prm->rlc_vlc_mmu_addr >> 32));
+	h264_set_field(shadow, F_MB_CTRL_BASE_LSB, (unsigned int)(prm->mb_ctrl_mmu_addr & 0xffffffffu));
+	h264_set_field(shadow, F_DEC_OUT_BASE_LSB, (unsigned int)(prm->output_mmu_addr & 0xffffffffu));
+	h264_set_field(shadow, F_DEC_OUT_BASE_MSB, (unsigned int)((uint64_t)prm->output_mmu_addr >> 32));
+
+	/* Stream base lives in swreg 20/21 (HWIF_STRM_BASE_LSB/MSB). */
+	{
+		const struct h264_reg_field stream_base = {20, 32, 0};
+		const struct h264_reg_field stream_base_msb = {21, 32, 0};
+		shadow[stream_base.swreg]    = (unsigned int)(prm->stream_mmu_addr & 0xffffffffu);
+		shadow[stream_base_msb.swreg] = (unsigned int)((uint64_t)prm->stream_mmu_addr >> 32);
+	}
+
+	/* TODO: DPB ref lists (swreg 84..99), POC table, CABAC init table,
+	 * scaling lists, chroma output base, RLC/MV working buffers. These need
+	 * the client's reconstructed reference surfaces (VAPictureH264[16]).
+	 * See H264RunAsic() in vc8000d software/source/h264high/h264hwd_asic.c.
 	 */
-	vcmd_cmd_wreg(&p, HANTRODEC_CFG_STAT_OFF, (1u << DWL_H264_E_BIT));
-	if (p >= end) return -1;
-	vcmd_cmd_wreg(&p, HANTRODEC_SYNTH_CFG_OFF, (uint32_t)(out_mmu & 0xffffffffu));
+
+	/* ---- kick off decode: set DEC_E in the SAME shadow so that other bits
+	 * in swreg1 (e.g. DEC_IRQ_DIS at lsb4) are preserved ---- */
+	h264_set_field(shadow, F_DEC_E, 1);
+
+	/* ---- emit shadow registers as WREG commands, skipping zero regs ---- */
+	for (i = 0; i < H264_REG_SHADOW_WORDS; i++) {
+		if (shadow[i] == 0)
+			continue;
+		if (p + 2 >= end)
+			return -1;
+		vcmd_cmd_wreg(&p, (uint32_t)i * 4, shadow[i]); /* reg offset in bytes */
+	}
 
 	vcmd_cmd_end(&p);
 
