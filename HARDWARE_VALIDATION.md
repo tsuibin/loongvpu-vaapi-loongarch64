@@ -37,6 +37,11 @@ occupy `renderD128`, so hardcoding it is wrong). Verify on the target:
 make probe        # prints "VPU node: /dev/dri/renderD<N>" or "No ... found"
 ```
 
+For a one-shot enable + verification (single sudo password prompt), run
+`bash scripts/check-hardware.sh` from the repo root. It performs the topic
+opt-in, package install, module load and all read-only gates, then prints a
+PASS/FAIL summary. Use `--dry-run` to preview without changing the system.
+
 If auto-detection picks the wrong node or you want to force one:
 
 ```sh

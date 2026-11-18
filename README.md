@@ -116,6 +116,10 @@ Nothing here has been validated on real silicon yet. See
 validation checklist (prerequisites, VCMD/buffer gates, H.264/HEVC decode
 progression, failure diagnosis, sign-off criteria).
 
+One-shot enable + check (single sudo prompt, then topic opt-in, package
+install, module load and all gates): `bash scripts/check-hardware.sh`.
+Preview without system changes: `bash scripts/check-hardware.sh --dry-run`.
+
 ## Roadmap
 
 Done:
