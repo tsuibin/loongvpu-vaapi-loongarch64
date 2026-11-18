@@ -14,9 +14,10 @@ platforms).
 > frame numbers, buffer addresses, DEC_E) **and the DPB reference list**:
 > 16 reference frames (base addresses, frame numbers, valid/long-term masks,
 > REF0 POC) plus P/B reference lists, all mapped from VA-API
-> `VAPictureParameterBufferH264`. Remaining: POC for refs 1..15 (work buffer),
-> CABAC init / scaling-list tables, and DMA-BUF allocation for bitstream and
-> working buffers (see Roadmap).
+> `VAPictureParameterBufferH264`, with DPB POC, CABAC init table and scaling
+> lists populated into the RLC/VLC work buffer. The full H.264 decode path is
+> now wired end to end; what remains is validation on real hardware and
+> extending the same approach to H.265/AV1 (see Roadmap).
 > Without a real LoongVPU device the driver soft-degrades to "decode disabled"
 > but still loads.
 
@@ -77,9 +78,13 @@ Source layout:
   tables, and the DRM backend.
 - `src/vpu_buffer.{c,h}` — GEM/DMA-BUF allocation + VPU MMU map/unmap.
 - `src/vcmd.{c,h}` — VCMD command builders, pool setup, reserve→run→wait→release,
-  and the H.264 decode command skeleton.
+  and the H.264 decode register programming.
+- `src/h264_regs.h` / `h264_decode_params.h` — VC8000D register map + VA params.
+- `src/work_buffer.{c,h}` / `h264_cabac_init.h` — RLC/VLC work-buffer fill
+  (CABAC init, POC table, scaling lists).
 - `tests/load_test.c` — hardware-free `dlopen()` smoke test.
-- `tests/cmd_test.c` — VCMD command-word encoding unit test.
+- `tests/cmd_test.c` — VCMD command-word + register encoding unit test.
+- `tests/workbuf_test.c` — work-buffer layout/content unit test.
 
 ## Build & test
 
@@ -121,10 +126,12 @@ Remaining (the hard part):
    lazily and sized from the frame's macroblock count per the SDK constants
    (`ensure_work_buffers`), wired to swreg 168/169 and 171. Graceful fallback
    to host memory when no render node is present.
-6. **Remaining H.264 work**: POC table for refs 1..15 and CABAC/scaling-list
-   contents are still not *populated* in the work buffer (only the buffers
-   exist). `h264PreparePOC()` in the SDK writes POC data into a work buffer;
-   that data must be filled before the VPU can decode B-frames correctly.
+6. **Work-buffer contents** — DONE. `src/work_buffer.c` fills the RLC/VLC
+   work buffer: standard H.264 CABAC init table @0 (`h264_cabac_init.h`,
+   920 u32 from the SDK), POC table @3680 (16 DPB top/bottom pairs + current
+   POC per `h264PreparePOC`), scaling lists @3816 (6x4x4 + 2x8x8 packed
+   big-endian per `h264PrepareScaleList`). Also programs `PICORD_COUNT_E`
+   and `TYPE1_QUANT_E`.
 7. **Per-codec support**: extend the same approach to H.265, then AV1.
 8. **Encode path**: `VAEntrypointEncSlice` via `HANTROENC_IOC*` ioctls.
 9. **Browser integration**: even with a working driver, the AOSC advisory notes

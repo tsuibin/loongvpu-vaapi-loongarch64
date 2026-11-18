@@ -3,6 +3,7 @@
 *.so
 tests/load_test
 tests/cmd_test
+tests/workbuf_test
 
 # Local editor / OS files
 *.swp

@@ -150,11 +150,16 @@ int vcmd_h264_build_decode_cmd(uint32_t *cmd, size_t cmd_words,
 	                                            prm->mb_adaptive_frame_field_flag);
 	h264_set_field(shadow, F_PIC_FIELDMODE_E,   prm->field_pic_flag);
 	h264_set_field(shadow, F_WRITE_MVS_E,       prm->reference_pic_flag);
-	h264_set_field(shadow, F_FILTERING_DIS,     !prm->constrained_intra_pred_flag ? 0 : 0);
+	h264_set_field(shadow, F_FILTERING_DIS,     0);   /* deblocking filter enabled */
 	h264_set_field(shadow, F_START_CODE_E,      1);   /* start-code emulation on */
 	h264_set_field(shadow, F_DEC_CLK_GATE_E,    1);
 	h264_set_field(shadow, F_DEC_IRQ_DIS,       1);   /* VCMD uses polling/IRQ via arbiter */
 	h264_set_field(shadow, F_APF_THRESHOLD,     8);
+	/* HW-side POC decoding + scaling-list enable. POC decoding is used for
+	 * any non-baseline stream (we always provide a POC table); scaling list
+	 * is enabled only when the IQ buffer supplied one. */
+	h264_set_field(shadow, F_PICORD_COUNT_E,   1);
+	h264_set_field(shadow, F_TYPE1_QUANT_E,    prm->scaling_list_present);
 
 	/* ---- buffer addresses (64-bit split into LSB/MSB registers) ---- */
 	h264_set_field(shadow, F_RLC_VLC_BASE_LSB, (unsigned int)(prm->rlc_vlc_mmu_addr & 0xffffffffu));

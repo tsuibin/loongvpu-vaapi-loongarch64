@@ -28,6 +28,7 @@
 #include "vpu_buffer.h"
 #include "vcmd.h"
 #include "h264_decode_params.h"
+#include "work_buffer.h"
 
 #define LOONGVPU_DRIVER_NAME   "LoongVPU (open-source scaffold)"
 #define LOONGVPU_VENDOR        "loongvpu-vaapi"
@@ -619,7 +620,7 @@ static VAStatus loongvpu_EndPicture(VADriverContextP ctx, VAContextID context)
 	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
 	struct tracked_surface *out;
 	struct h264_decode_params prm;
-	struct tracked_buffer *pic = NULL, *slice = NULL, *bsbuf = NULL;
+	struct tracked_buffer *pic = NULL, *slice = NULL, *bsbuf = NULL, *iq = NULL;
 	int i, words;
 
 	(void)context;
@@ -641,6 +642,8 @@ static VAStatus loongvpu_EndPicture(VADriverContextP ctx, VAContextID context)
 			slice = b;
 		else if (b->type == VASliceDataBufferType && !bsbuf)
 			bsbuf = b;
+		else if (b->type == VAIQMatrixBufferType && !iq)
+			iq = b;
 	}
 	if (!pic || !slice)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
@@ -673,6 +676,10 @@ static VAStatus loongvpu_EndPicture(VADriverContextP ctx, VAContextID context)
 		prm.field_pic_flag                = p->pic_fields.bits.field_pic_flag;
 		prm.reference_pic_flag            = p->pic_fields.bits.reference_pic_flag;
 		prm.constrained_intra_pred_flag   = p->pic_fields.bits.constrained_intra_pred_flag;
+
+		/* Current picture POC (for the work-buffer POC table tail). */
+		prm.curr_poc_top    = p->CurrPic.TopFieldOrderCnt;
+		prm.curr_poc_bottom = p->CurrPic.BottomFieldOrderCnt;
 
 		prm.slice_data_size       = s->slice_data_size;
 		prm.slice_data_bit_offset = s->slice_data_bit_offset;
@@ -727,6 +734,16 @@ static VAStatus loongvpu_EndPicture(VADriverContextP ctx, VAContextID context)
 				prm.refs.list1[n] = (uint8_t)(r->picture_id & 0x1f);
 				prm.refs.list1_count++;
 			}
+
+			/* Scaling lists from the IQ matrix buffer. */
+			if (iq) {
+				VAIQMatrixBufferH264 *q = iq->data;
+				prm.scaling_list_present = 1;
+				memcpy(prm.scaling_list4x4, q->ScalingList4x4,
+				       sizeof(prm.scaling_list4x4));
+				memcpy(prm.scaling_list8x8, q->ScalingList8x8,
+				       sizeof(prm.scaling_list8x8));
+			}
 		}
 	}
 
@@ -747,6 +764,11 @@ static VAStatus loongvpu_EndPicture(VADriverContextP ctx, VAContextID context)
 	                     ? vpu_buffer_mmu(drv->rlc_vlc_work) : 0;
 	prm.mb_ctrl_mmu_addr = drv->mb_ctrl_work
 	                     ? vpu_buffer_mmu(drv->mb_ctrl_work) : 0;
+
+	/* Fill CABAC init table, POC table and scaling lists into the RLC/VLC
+	 * work buffer before submission (mirrors SDK h264Prepare* functions). */
+	if (drv->rlc_vlc_work)
+		h264_fill_work_buffer(vpu_buffer_vaddr(drv->rlc_vlc_work), &prm);
 
 	words = vcmd_h264_build_decode_cmd(drv->cmd, VCMD_CMD_WORDS, &prm);
 	if (words < 0)

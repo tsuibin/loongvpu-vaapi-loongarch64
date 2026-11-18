@@ -80,6 +80,16 @@ struct h264_decode_params {
 	/* DPB reference frames and lists */
 	struct h264_dpb_ref dpb[16];
 	struct h264_ref_lists refs;
+
+	/* Current picture POC (for work-buffer POC table tail).
+	 * field_pic_flag / mb_adaptive_frame_field_flag above (bitfields) apply. */
+	int32_t  curr_poc_top;
+	int32_t  curr_poc_bottom;
+
+	/* Scaling lists (from VAIQMatrixBufferH264), 0 = not present */
+	uint8_t  scaling_list_present;
+	uint8_t  scaling_list4x4[6][16];
+	uint8_t  scaling_list8x8[2][64];
 };
 
 #endif /* H264_DECODE_PARAMS_H */

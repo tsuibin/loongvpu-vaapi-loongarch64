@@ -10,9 +10,9 @@ CFLAGS  += $(shell pkg-config --cflags libva)
 LDFLAGS += -shared
 
 TARGET  := loongvpu_drv_video.so
-SRCS    := src/loongvpu_drv_video.c src/vpu_buffer.c src/vcmd.c
+SRCS    := src/loongvpu_drv_video.c src/vpu_buffer.c src/vcmd.c src/work_buffer.c
 OBJS    := $(SRCS:.c=.o)
-HDRS    := src/loongvpu_abi.h src/vpu_buffer.h src/vcmd.h
+HDRS    := src/loongvpu_abi.h src/vpu_buffer.h src/vcmd.h src/work_buffer.h src/h264_decode_params.h src/h264_regs.h
 
 # libva on this system looks for drivers under /usr/lib/dri
 DRIVERDIR ?= /usr/lib/dri
@@ -35,9 +35,13 @@ tests/load_test: tests/load_test.c
 tests/cmd_test: tests/cmd_test.c src/vcmd.c src/loongvpu_abi.h src/vcmd.h
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/cmd_test.c src/vcmd.c
 
-test: tests/load_test tests/cmd_test $(TARGET)
+tests/workbuf_test: tests/workbuf_test.c src/work_buffer.c src/h264_cabac_init.h src/work_buffer.h src/h264_decode_params.h
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/workbuf_test.c src/work_buffer.c
+
+test: tests/load_test tests/cmd_test tests/workbuf_test $(TARGET)
 	LD_LIBRARY_PATH=. ./tests/load_test ./$(TARGET)
 	./tests/cmd_test
+	./tests/workbuf_test
 
 install: $(TARGET)
 	install -d $(DESTDIR)$(DRIVERDIR)
@@ -47,4 +51,4 @@ install: $(TARGET)
 	@echo "  LIBVA_DRIVERS_PATH=$(DESTDIR)$(DRIVERDIR) LIBVA_DRIVER_NAME=loongvpu vainfo"
 
 clean:
-	rm -f $(OBJS) $(TARGET) tests/load_test tests/cmd_test
+	rm -f $(OBJS) $(TARGET) tests/load_test tests/cmd_test tests/workbuf_test

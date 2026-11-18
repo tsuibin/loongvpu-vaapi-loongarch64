@@ -28,6 +28,8 @@ enum {
 	F_POC_LENGTH, F_PIC_INTERLACE_E, F_PIC_FIELDMODE_E, F_IDR_PIC_ID,
 	F_START_CODE_E, F_WRITE_MVS_E, F_APF_THRESHOLD, F_REFPIC_MK_LEN,
 	F_DEC_CLK_GATE_E, F_DEC_IRQ_DIS,
+	F_PICORD_COUNT_E,      /* HWIF_PICORD_COUNT_E     swreg 3 lsb 9  (POC decode) */
+	F_TYPE1_QUANT_E,       /* HWIF_TYPE1_QUANT_E      swreg 5 lsb 24 (scaling list) */
 	F_COUNT
 };
 
@@ -62,6 +64,8 @@ static const struct h264_reg_field h264_fields[F_COUNT] = {
 	{  8, 11, 17 }, /* F_REFPIC_MK_LEN       HWIF_REFPIC_MK_LEN */
 	{  2,  1, 10 }, /* F_DEC_CLK_GATE_E      HWIF_DEC_CLK_GATE_E */
 	{  1,  1,  4 }, /* F_DEC_IRQ_DIS         HWIF_DEC_IRQ_DIS */
+	{  3,  1,  9 }, /* F_PICORD_COUNT_E      HWIF_PICORD_COUNT_E */
+	{  5,  1, 24 }, /* F_TYPE1_QUANT_E       HWIF_TYPE1_QUANT_E */
 };
 
 #define H264_REG_SHADOW_WORDS 256
