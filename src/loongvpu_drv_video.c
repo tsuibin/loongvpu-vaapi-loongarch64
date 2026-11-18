@@ -357,8 +357,9 @@ static VAStatus loongvpu_QueryConfigAttributes(
 	VAProfile *profile, VAEntrypoint *entrypoint,
 	VAConfigAttrib *attrib_list, int *num_attribs)
 {
-	(void)ctx; (void)config_id;
-	if (profile) *profile = VAProfileH264High;
+	struct loongvpu_driver_data *drv = ctx ? ctx->pDriverData : NULL;
+
+	if (profile) *profile = drv ? config_profile(drv, config_id) : VAProfileH264High;
 	if (entrypoint) *entrypoint = VAEntrypointVLD;
 	if (num_attribs) *num_attribs = 0;
 	(void)attrib_list;
@@ -835,6 +836,11 @@ static int is_hevc_profile(VAProfile p)
 	return p == VAProfileHEVCMain || p == VAProfileHEVCMain10;
 }
 
+static int is_av1_profile(VAProfile p)
+{
+	return p == VAProfileAV1Profile0 || p == VAProfileAV1Profile1;
+}
+
 /* HEVC/H.265 decode submission (vaEndPicture for HEVC configs). */
 static VAStatus end_picture_hevc(VADriverContextP ctx, VAContextID context)
 {
@@ -993,6 +999,15 @@ static VAStatus loongvpu_EndPicture(VADriverContextP ctx, VAContextID context)
 
 	if (!drv)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
+	if (is_av1_profile(drv->current_profile)) {
+		/* AV1 is advertised for capability completeness, but this open
+		 * VC8000D SDK has no AV1 register map and the AOSC advisory notes
+		 * VPU AV1 decode is broken. Refuse explicitly rather than feed the
+		 * AV1 bitstream to the H.264/HEVC builders (which would misdecode). */
+		fprintf(stderr, "loongvpu: AV1 decode is not supported by this driver "
+		                "(no open AV1 VPU register map); use software dav1d\n");
+		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+	}
 	if (is_hevc_profile(drv->current_profile))
 		return end_picture_hevc(ctx, context);
 	return end_picture_h264(ctx, context);

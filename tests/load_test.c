@@ -66,10 +66,52 @@ int main(int argc, char **argv)
 	}
 
 	printf("driver loaded OK; advertised profiles (%d):\n", np);
-	for (i = 0; i < np; i++) {
-		ne = 0;
-		ctx.vtable->vaQueryConfigEntrypoints(&ctx, profiles[i], eps, &ne);
-		printf("  profile %2d: %d entrypoint(s)\n", profiles[i], ne);
+	{
+		int av1_advertised = 0;
+		for (i = 0; i < np; i++) {
+			ne = 0;
+			ctx.vtable->vaQueryConfigEntrypoints(&ctx, profiles[i], eps, &ne);
+			printf("  profile %2d: %d entrypoint(s)\n", profiles[i], ne);
+			if (profiles[i] == VAProfileAV1Profile0)
+				av1_advertised = 1;
+		}
+		if (!av1_advertised) {
+			fprintf(stderr, "AV1 profile not advertised\n");
+			ctx.vtable->vaTerminate(&ctx);
+			dlclose(handle);
+			return 1;
+		}
+
+		/* Exercise the AV1 stub: create config + context + begin/end and
+		 * assert decode is explicitly refused (not mis-routed to H.264). */
+		{
+			VAConfigID cid = 0;
+			VAContextID ctxid = 0;
+			VASurfaceID target = 1;
+			st = ctx.vtable->vaCreateConfig(&ctx, VAProfileAV1Profile0,
+			                                VAEntrypointVLD, NULL, 0, &cid);
+			if (st != VA_STATUS_SUCCESS) {
+				fprintf(stderr, "AV1 CreateConfig failed: %d\n", st);
+				ctx.vtable->vaTerminate(&ctx); dlclose(handle); return 1;
+			}
+			st = ctx.vtable->vaCreateContext(&ctx, cid, 64, 64, 0,
+			                                 &target, 1, &ctxid);
+			if (st != VA_STATUS_SUCCESS) {
+				fprintf(stderr, "AV1 CreateContext failed: %d\n", st);
+				ctx.vtable->vaTerminate(&ctx); dlclose(handle); return 1;
+			}
+			st = ctx.vtable->vaBeginPicture(&ctx, ctxid, target);
+			if (st != VA_STATUS_SUCCESS) {
+				fprintf(stderr, "AV1 BeginPicture failed: %d\n", st);
+				ctx.vtable->vaTerminate(&ctx); dlclose(handle); return 1;
+			}
+			st = ctx.vtable->vaEndPicture(&ctx, ctxid);
+			if (st != VA_STATUS_ERROR_UNSUPPORTED_PROFILE) {
+				fprintf(stderr, "AV1 EndPicture should be UNSUPPORTED_PROFILE, got %d\n", st);
+				ctx.vtable->vaTerminate(&ctx); dlclose(handle); return 1;
+			}
+			printf("AV1 stub: decode correctly refused (UNSUPPORTED_PROFILE)\n");
+		}
 	}
 
 	/* Tear down through the driver's own terminate hook. */

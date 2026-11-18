@@ -44,7 +44,9 @@ so the userspace side no longer has to be a black box.
 - `vainfo` lists all supported profiles/entrypoints:
   - H.264 (Baseline/Main/High) decode + encode
   - H.265 (Main/Main10) decode + encode
-  - AV1 Profile 0 decode
+  - AV1 Profile 0 decode — advertised for capability completeness only;
+    `vaEndPicture` explicitly returns `VA_STATUS_ERROR_UNSUPPORTED_PROFILE`
+    (see "AV1" in Roadmap). No open AV1 VPU register map exists.
 - `make test` passes both the `dlopen()` smoke test and the VCMD command-word
   unit test (`cmd_test`), with no VPU needed.
 - Driver opens `/dev/dri/renderD128`, queries VCMD/PM capabilities, and opens
@@ -152,7 +154,14 @@ Remaining (the hard part):
    to `HWIF_CUR_POC_00..15` (swreg 46..49, signed 8-bit clipped). Remaining:
    less-common fields (tiles/SAO details) and real-hardware validation.
    `config/context` profile tables added for routing.
-8. **AV1**: extend the same approach (decode profile already advertised).
+8. **AV1 — unsupported stub.** `VAProfileAV1Profile0` is advertised
+   (`VAEntrypointVLD`), but decode is explicitly refused with
+   `VA_STATUS_ERROR_UNSUPPORTED_PROFILE` in `vaEndPicture`. Rationale: the open
+   VC8000D SDK has no AV1 source (`DEC_MODE` stops at AVS2=16, no AV1 registers
+   in `8170table.h`), and the AOSC advisory states VPU AV1 decode produces
+   abnormal pictures. No register values are invented — clients get a clean
+   error and are directed to software dav1d. To implement real AV1 decode,
+   an AV1-capable VPU SDK/datasheet for this chip is required.
 9. **Encode path**: `VAEntrypointEncSlice` via `HANTROENC_IOC*` ioctls.
 10. **Browser integration**: even with a working driver, the AOSC advisory notes
    Chromium currently fails to use VA-API on this VPU; mpv/GStreamer are easier
