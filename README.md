@@ -49,8 +49,10 @@ so the userspace side no longer has to be a black box.
     (see "AV1" in Roadmap). No open AV1 VPU register map exists.
 - `make test` passes both the `dlopen()` smoke test and the VCMD command-word
   unit test (`cmd_test`), with no VPU needed.
-- Driver opens `/dev/dri/renderD128`, queries VCMD/PM capabilities, and opens
-  the VCMD command-buffer pool (soft failure when no hardware is present).
+- Driver auto-discovers the VPU render node by probing `/dev/dri/renderD*`
+  with `GET_VCMDSUP` (or `LOONGVPU_RENDER_NODE` to force one), queries VCMD/PM
+  capabilities and opens the command-buffer pool (soft failure when no VPU).
+  `make probe` reports the node on a target machine.
 - **DMA-BUF + MMU** (`src/vpu_buffer.c`): GEM dumb create → GETPADDR → MAP_DUMB
   /mmap → `HANTRO_IOCS_MMU_MEM_MAP`, with matching unmap/close teardown.
   `vaCreateSurfaces` now allocates and MMU-maps real buffers.

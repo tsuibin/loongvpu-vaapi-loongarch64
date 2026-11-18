@@ -29,17 +29,23 @@ mode and no decode is happening.
 - [ ] `LIBVA_DRIVERS_PATH` / `LIBVA_DRIVER_NAME` point at this build (NOT a
       system `loongvpu_drv_video.so`; check `/usr/lib/dri` for a stale copy).
 
-**Known wiring constraint:** `loongvpu_drv_video.c` hardcodes
-`LOONGVPU_RENDER_NODE = "/dev/dri/renderD128"`. On the target machine verify
-which render node belongs to the VPU (the LG200 GPU may occupy `renderD128`):
+**Render-node discovery:** the driver probes `/dev/dri/renderD0..255` with
+`DRM_IOCTL_HANTRO_GET_VCMDSUP` to auto-detect the VPU node (the LG200 GPU may
+occupy `renderD128`, so hardcoding it is wrong). Verify on the target:
 
 ```sh
-ls -l /dev/dri/
-for n in /dev/dri/renderD*; do echo "== $n"; udevadm info --query=all "$n" | grep -i driver; done
+make probe        # prints "VPU node: /dev/dri/renderD<N>" or "No ... found"
 ```
 
-If the VPU is not `renderD128`, fix the macro (or make it configurable) before
-continuing. This alone can explain every failure below.
+If auto-detection picks the wrong node or you want to force one:
+
+```sh
+LOONGVPU_RENDER_NODE=/dev/dri/renderD129 LIBVA_DRIVERS_PATH=$PWD \
+  LIBVA_DRIVER_NAME=loongvpu vainfo
+```
+
+A "No render node found" result means the kernel VPU module is not loaded —
+fix that before continuing; it explains every failure below.
 
 ---
 
@@ -50,10 +56,12 @@ LIBVA_DRIVERS_PATH=$PWD LIBVA_DRIVER_NAME=loongvpu vainfo
 ```
 
 - [ ] `libva info: va_openDriver() returns 0`
-- [ ] **stderr shows `loongvpu: VCMD pool ready`** — this is the single most
-      important gate. If instead you see `VCMD pool unavailable (decode
-      disabled)`, `GET_CMDBUF_PARAMETER` failed: the render node is wrong, the
-      kernel module is absent/incompatible, or the VPU is not enabled. Stop
+- [ ] **stderr shows `loongvpu: VPU render node = /dev/dri/renderD<N>` followed
+      by `loongvpu: VCMD pool ready`** — these are the critical gates. If you
+      see `no LoongVPU render node found`, the kernel VPU module is absent —
+      no `renderD<N>` answers `GET_VCMDSUP`. If you see `VCMD pool unavailable
+      (decode disabled)`, the node was found but `GET_CMDBUF_PARAMETER`
+      failed: ABI/module mismatch. Stop
       here and fix Phase 0.
 - [ ] Profiles listed: H.264 Baseline/Main/High, HEVC Main/Main10 (VLD+Enc),
       AV1 Profile 0 (VLD, advertised but refused at decode — by design).
@@ -168,8 +176,9 @@ any stream that fails with its SPS/PPS for later register work.
 
 | Symptom / log | Likely cause | First action |
 |---|---|---|
-| `cannot open /dev/dri/renderD128` | Wrong render node or permissions | Phase 0 render-node check; fix macro |
-| `VCMD pool unavailable (decode disabled)` | GETPADDR/VCMD ioctl rejected; wrong node; module absent | Confirm HW_ID and kernel module; Phase 0 |
+| `no LoongVPU render node found` | VPU kernel module absent/not bound; no render node answers GET_VCMDSUP | Load/built loongvpu module; run `make probe` |
+| `forced node ... is not a VPU` | `LOONGVPU_RENDER_NODE` points at GPU/non-VPU node | Point it at the node `make probe` reports |
+| `VCMD pool unavailable (decode disabled)` | VPU node found but GET_CMDBUF_PARAMETER rejected (ABI/module mismatch) | Confirm HW_ID `0x8001` and kernel module version |
 | `CREATE_DUMB failed` | Render node not a DRM/GEM device | Confirm VPU node |
 | `MMU_MEM_MAP failed` | VPU MMU unavailable/incompatible | Kernel module version; check dmesg |
 | `RESERVE/LINK_RUN_CMDBUF failed` | Malformed command stream or no VPU | Dump WREG stream; check END/DEC_E |

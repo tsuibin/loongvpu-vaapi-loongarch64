@@ -94,29 +94,75 @@ struct loongvpu_driver_data {
 /* DRM backend                                                                */
 /* ------------------------------------------------------------------------- */
 
-/* Open the render node and query basic capabilities from the kernel driver.
- * Failures are soft: libva should still be able to load the driver even when
- * no VPU hardware is present (e.g. on a build machine). */
+/* Find the VPU DRM render node. The GPU (LG200) and VPU can both expose
+ * /dev/dri/renderD* nodes; hardcoding renderD128 is wrong. The kernel Hantro
+ * driver answers DRM_IOCTL_HANTRO_GET_VCMDSUP on a VPU render node and rejects
+ * it (EINVAL/ENOTTY) on non-VPU nodes, so we probe each node with that ioctl.
+ * LOONGVPU_RENDER_NODE env var forces a specific node for debugging. */
+static int find_vpu_render_node(struct loongvpu_driver_data *drv)
+{
+	int i, fd, r;
+	const char *env = getenv("LOONGVPU_RENDER_NODE");
+	char path[64];
+	uint32_t sup = 0;
+
+	if (env && *env) {
+		fd = open(env, O_RDWR | O_CLOEXEC);
+		if (fd < 0) {
+			fprintf(stderr, "loongvpu: cannot open forced node %s: %s\n",
+			        env, strerror(errno));
+			return -1;
+		}
+		r = ioctl(fd, DRM_IOCTL_HANTRO_GET_VCMDSUP, &sup);
+		if (r < 0) {
+			fprintf(stderr, "loongvpu: forced node %s is not a VPU "
+			                "(GET_VCMDSUP: %s)\n", env, strerror(errno));
+			close(fd);
+			return -1;
+		}
+		snprintf(path, sizeof(path), "%s", env);
+		fprintf(stderr, "loongvpu: using forced VPU node %s\n", path);
+	} else {
+		for (i = 0; i < 256; i++) {
+			snprintf(path, sizeof(path), "/dev/dri/renderD%d", i);
+			fd = open(path, O_RDWR | O_CLOEXEC);
+			if (fd < 0)
+				continue;
+			r = ioctl(fd, DRM_IOCTL_HANTRO_GET_VCMDSUP, &sup);
+			if (r == 0)
+				break;            /* this is the VPU node */
+			close(fd);
+			fd = -1;
+		}
+		if (fd < 0) {
+			fprintf(stderr, "loongvpu: no LoongVPU render node found "
+			                "(probed /dev/dri/renderD0..255); is the "
+			                "loongvpu kernel module loaded? Override "
+			                "with LOONGVPU_RENDER_NODE=/dev/dri/renderD<N>\n");
+			return -1;
+		}
+	}
+
+	snprintf(drv->render_node, sizeof(drv->render_node), "%s", path);
+	drv->vcmd_supported = (int)sup;
+	return fd;
+}
+
+/* Open the discovered render node and query basic capabilities.
+ * Failures are soft: libva should still load the driver with no VPU. */
 static void loongvpu_drm_init(struct loongvpu_driver_data *drv)
 {
 	int fd;
 	uint32_t sup = 0;
 
 	drv->drm_fd = -1;
-	snprintf(drv->render_node, sizeof(drv->render_node), "%s",
-	         LOONGVPU_RENDER_NODE);
-
-	fd = open(drv->render_node, O_RDWR | O_CLOEXEC);
-	if (fd < 0) {
-		fprintf(stderr, "loongvpu: cannot open %s: %s\n",
-		        drv->render_node, strerror(errno));
+	fd = find_vpu_render_node(drv);
+	if (fd < 0)
 		return;
-	}
+
+	fprintf(stderr, "loongvpu: VPU render node = %s\n", drv->render_node);
 
 	/* These ioctls are advisory; do not fail driver init if unsupported. */
-	if (ioctl(fd, DRM_IOCTL_HANTRO_GET_VCMDSUP, &sup) == 0)
-		drv->vcmd_supported = (int)sup;
-
 	sup = 0;
 	if (ioctl(fd, DRM_IOCTL_HANTRO_GET_PMSUP, &sup) == 0)
 		drv->pm_supported = (int)sup;

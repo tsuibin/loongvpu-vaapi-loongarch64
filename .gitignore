@@ -5,6 +5,7 @@ tests/load_test
 tests/cmd_test
 tests/workbuf_test
 tests/hevcwb_test
+tests/probe_node
 
 # Local editor / OS files
 *.swp

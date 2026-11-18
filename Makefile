@@ -41,6 +41,13 @@ tests/workbuf_test: tests/workbuf_test.c src/work_buffer.c src/h264_cabac_init.h
 tests/hevcwb_test: tests/hevcwb_test.c src/hevc_work_buffer.c src/hevc_work_buffer.h src/hevc_decode_params.h
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/hevcwb_test.c src/hevc_work_buffer.c
 
+# Hardware diagnostic (not part of `make test`): find the VPU render node.
+tests/probe_node: tests/probe_node.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+probe: tests/probe_node
+	./tests/probe_node
+
 test: tests/load_test tests/cmd_test tests/workbuf_test tests/hevcwb_test $(TARGET)
 	LD_LIBRARY_PATH=. ./tests/load_test ./$(TARGET)
 	./tests/cmd_test
@@ -55,4 +62,4 @@ install: $(TARGET)
 	@echo "  LIBVA_DRIVERS_PATH=$(DESTDIR)$(DRIVERDIR) LIBVA_DRIVER_NAME=loongvpu vainfo"
 
 clean:
-	rm -f $(OBJS) $(TARGET) tests/load_test tests/cmd_test tests/workbuf_test tests/hevcwb_test
+	rm -f $(OBJS) $(TARGET) tests/load_test tests/cmd_test tests/workbuf_test tests/hevcwb_test tests/probe_node
