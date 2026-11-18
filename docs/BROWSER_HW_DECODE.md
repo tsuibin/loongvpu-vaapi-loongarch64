@@ -17,6 +17,8 @@ A second pass re-ran the verification steps in live X11 browser sessions; see
 - Chromium 148 一般免 flag；Firefox 160 需要在 `about:config` 里强制开启。
 - 浏览器走的是 VA-API surface → DMABUF → EGL 合成器的零拷贝路径，**不需要**
   `hwdownload`。所以「ffmpeg 取帧回内存失败」不影响浏览器播放。
+- **4K60 要选 HEVC 而不是 H.264**：Firefox 实测 H.264 掉帧约 57%，HEVC 只掉
+  约 8%；Chromium 播 4K H.264 还会触发驱动缓冲 OOM 崩溃。1080p60 则两者都流畅。
 
 ---
 
@@ -82,10 +84,12 @@ answers `DRM_IOCTL_HANTRO_GET_VCMDSUP`. This machine only exposes
 | VP8 / VP9 | — | **no** | always software decoded |
 | JPEG | Baseline | yes | not used by `<video>` playback |
 
-YouTube and similar sites prefer VP9 or AV1. If you specifically want the VPU
-path, force H.264 with an extension such as `h264ify` / `enhanced-h264ify`,
-otherwise a "hardware decoder: false" result may simply mean the site served
-VP9/AV1 while only H.264/HEVC are wired up in the browser.
+YouTube and similar sites prefer VP9 or AV1. A "hardware decoder: false" result
+may simply mean the site served VP9/AV1 (unsupported here) while only
+H.264/HEVC are wired up. For **1080p**, forcing H.264 with `h264ify` /
+`enhanced-h264ify` is fine; for **4K60 do not do that** — measured browser
+performance is much worse with H.264 than with HEVC (see §6.1). If the site
+offers HEVC, prefer it; otherwise cap the resolution at 1080p60.
 
 ## 4. Prerequisites on this machine (verified)
 
@@ -217,6 +221,51 @@ Verify:
    `FEATURE_FAILURE_VIDEO_DECODING_TEST_FAILED` in `about:support` mean the
    force-enabled pref above was not applied.
 
+### 6.1 4K60: use HEVC, not H.264
+
+Measured on 2026-11-18 with generated 4K60 clips (H.264 5 s / 300 frames;
+HEVC 3 s / 180 frames), using `getVideoPlaybackQuality()` deltas across a
+replay in a live X11 session:
+
+| Browser / path | Codec | 4K60 dropped frames |
+|---|---|---|
+| Firefox 160, VAAPI forced | H.264 | **57.0%** (171/300) |
+| Firefox 160, VAAPI forced | **HEVC** | **7.8–8.9%** (14–16/180) |
+| Firefox 160, VAAPI forced | H.264 1080p60 | **0%** |
+| Chromium 148 `VaapiVideoDecoder` | H.264 | ~51% dropped, then GPU process crash |
+| mpv `--vo=vaapi --hwdec=vaapi` | H.264 | ~41% dropped, no crash |
+| ffmpeg `-hwaccel_output_format vaapi` | H.264 / HEVC | 85 fps / 115 fps, no drops |
+
+HEVC hardware decode was confirmed in the Firefox log:
+
+```
+FFMPEG: Using preferred hardware codec hevc
+FFMPEG: IsHardwareAccelerated=true
+FFMPEG: Requesting pixel format VAAPI_VLD
+```
+
+So this is not a software fallback. The gain comes from the codec: VPU
+decode-only throughput is ~1.9x realtime for HEVC versus ~1.4x for H.264,
+leaving enough headroom for WebRender compositing. The same ~8% HEVC result
+was reproduced with and without `gfx.webrender.compositor.force-enabled`,
+`MOZ_X11_EGL` and `MOZ_DRM_DEVICE`, so those knobs are not the cause.
+
+Practical steps for 4K60 in Firefox:
+
+1. Keep the three prefs above (they enable hardware decode at all).
+2. Prefer **HEVC** sources. For local files, transcode once:
+   ```sh
+   ffmpeg -i input.mp4 -c:v libx265 -preset ultrafast -pix_fmt yuv420p \
+     -tag:v hvc1 -movflags +faststart output_hevc.mp4
+   ```
+3. Do not use `h264ify` for 4K; it forces the slower H.264 path.
+4. If only VP9/AV1/H.264 is available, cap at 1080p60 — that is the only
+   zero-drop configuration measured here.
+5. Ineffectual (tested, no gain): `media.ffmpeg.vaapi.force-surface-zero-copy`,
+   `gfx.webrender.compositor.force-enabled`, `MOZ_X11_EGL=1`,
+   `MOZ_DRM_DEVICE=...`, shrinking the window (worse: ~70% dropped). CMA is
+   already 256M with ~150M free, so enlarging it is not indicated.
+
 ## 7. Troubleshooting
 
 | Symptom | Likely cause | Action |
@@ -226,7 +275,7 @@ Verify:
 | `CmaTotal: 0` | boot param missing | add `cma=256M` to GRUB cmdline and reboot |
 | Chromium "Video Decode: Software only" | flags / driver allowlist / AOSC platform limitation | try flags in §5, then validate with mpv/ffmpeg |
 | Firefox decode disabled | non-Intel/AMD GPU not allowlisted | `media.hardware-video-decoding.force-enabled=true` |
-| Playback uses software on VP9/AV1 sites | codec unsupported by driver | force H.264 via h264ify extension |
+| Playback uses software on VP9/AV1 sites | codec unsupported by driver | cap at 1080p; for 4K prefer HEVC — do **not** force H.264 (see §6.1) |
 | `hwdownload` fails with -38 | driver cannot export surfaces to system memory | expected; irrelevant to browsers, use VAAPI render path |
 | `chrome://gpu` blank in headless | ANGLE Vulkan init failure in headless mode | check in the real X11 desktop session |
 
@@ -236,7 +285,11 @@ Verify:
   system memory, so FFmpeg filters/transcoding that need CPU-side frames fail.
 - The open scaffold in this repo is **not** hardware-validated and currently
   sees no VPU render node; it is not a browser-ready driver yet.
-- AOSC notes 4K decode performance is poor; stay at 1080p for correctness work.
+- AOSC notes 4K decode performance is poor. More precisely: the VPU can do
+  4K60 decode-only at >realtime (ffmpeg with explicit VAAPI output), but in
+  browsers the codec matters — H.264 4K60 drops about half the frames and
+  crashes Chromium, while HEVC 4K60 drops only ~8% in Firefox. 1080p60 is
+  the only zero-drop browser configuration.
 - Full browser playback involves the GPU/compositor stack as well as VPU
   decode; a working `vainfo`/mpv result is necessary but not always sufficient.
 
@@ -257,6 +310,10 @@ Re-checked in live sessions on kernel `7.1.7-aosc-main-16k` using the closed
 | Chromium feature names (§5) | `grep -ao` on `/usr/lib/chromium/chromium` | `VaapiVideoDecoder`, `VaapiIgnoreDriverChecks`, `AcceleratedVideoDecodeLinuxGL` present; `VaapiVideoDecodeLinuxGL`, `UseChromeOSDirectVideoDecoder`, `PlatformHEVCDecoderSupport` absent |
 | Firefox prefs (§6) | search `libxul.so` + `omni.ja` | `media.hardware-video-decoding.force-enabled`, `gfx.webrender.software`, `layers.acceleration.force-enabled`, `MOZ_DRM_DEVICE` present; `gfx.webrender.enabled`, `media.ffmpeg.vaapi.enabled` absent |
 | Firefox real decode (§6) | `MOZ_LOG="FFmpegVideo:5" firefox --profile <pref-set> h264.mp4` | `Initialising VA-API FFmpeg decoder`, `VA-API FFmpeg init successful`, `IsHardwareAccelerated=true`, `Requesting pixel format VAAPI_VLD`, continuous `VA-API frame` lines |
+| 4K60 ffmpeg output format (§6.1) | 5 s 4K60 H.264, with/without `-hwaccel_output_format vaapi` | default: 46 fps, 300 × ~12.4 MB memset per frame; explicit `vaapi`: 85 fps, 0 such memset; HEVC explicit: 115 fps |
+| 4K60 Firefox codec (§6.1) | CDP/BiDi `getVideoPlaybackQuality()` replay delta | H.264 57.0% dropped (171/300); HEVC 7.8–8.9% dropped (14–16/180), logged as `Using preferred hardware codec hevc` + `VAAPI_VLD`; 1080p60 H.264 0% |
+| 4K60 Chromium (§6.1) | CDP playback of 4K60 H.264 | `VaapiVideoDecoder`, ~51% dropped, then `bo alloc failed: out of memory, file hantro_bufmgr.c, line 268` and GPU process `exit_code=134` (reproduced twice) |
+| 4K60 ineffective knobs (§6.1) | `force-surface-zero-copy`, compositor force, `MOZ_X11_EGL`, `MOZ_DRM_DEVICE`, small window | 57–59% dropped either way; smaller window worse (~70%) |
 
 Headless browser checks are not representative: headless Chromium fails ANGLE
 Vulkan initialization and headless Firefox uses SWGL with WebGL context loss.
