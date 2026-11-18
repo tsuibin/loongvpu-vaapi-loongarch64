@@ -120,6 +120,10 @@ One-shot enable + check (single sudo prompt, then topic opt-in, package
 install, module load and all gates): `bash scripts/check-hardware.sh`.
 Preview without system changes: `bash scripts/check-hardware.sh --dry-run`.
 
+For how Chromium and Firefox reach VA-API hardware decode on this platform
+(which driver is loaded, codec support, flags/prefs and verification), see
+[`docs/BROWSER_HW_DECODE.md`](docs/BROWSER_HW_DECODE.md).
+
 **Hardware finding:** on the dev machine the VPU is bound (`hantro` on PCI
 `00:06.3`) but cannot init its contiguous memory pool because the kernel has
 no CMA reserved (`CmaTotal: 0`). See
