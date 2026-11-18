@@ -120,6 +120,12 @@ One-shot enable + check (single sudo prompt, then topic opt-in, package
 install, module load and all gates): `bash scripts/check-hardware.sh`.
 Preview without system changes: `bash scripts/check-hardware.sh --dry-run`.
 
+**Hardware finding:** on the dev machine the VPU is bound (`hantro` on PCI
+`00:06.3`) but cannot init its contiguous memory pool because the kernel has
+no CMA reserved (`CmaTotal: 0`). See
+[`docs/CMA_BOOT_SETUP.md`](docs/CMA_BOOT_SETUP.md) for GRUB `cma=256M` boot
+instructions (requires a reboot; not applied automatically).
+
 ## Roadmap
 
 Done:

@@ -17,7 +17,11 @@ mode and no decode is happening.
 - [ ] Kernel **VPU module is built and loaded**. The open DKMS driver targets
       Linux 6.6 (AOSC backports to 6.18); this project's dev machine runs
       Linux 7.1, so a matching module build may be required first.
-      Check with `lsmod | grep -i vpu` / `dmesg | grep -i vpu`.
+      Check with `lsmod | grep -i vpu` / `lspci -nnk | grep -A3 7a56` /
+      `dmesg | grep -i hantro`. If bound but `alloc_pages_pool` / `order:10`
+      failures appear, **CMA must be reserved at boot** — see
+      [`docs/CMA_BOOT_SETUP.md`](docs/CMA_BOOT_SETUP.md) (`cma=256M` GRUB
+      cmdline + reboot). Without CMA the driver cannot init and VCMD is dead.
 - [ ] Userspace VPU package installed (AOSC preview, from the advisory):
       `oma topics --opt-in loongvpu-0.1.0 && oma install loongvpu`
 - [ ] Confirm HW_ID is VC8000D (`0x8001`), not G1 (`0x6731`) / G2 (`0x6732`) —
