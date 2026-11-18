@@ -109,6 +109,11 @@ sudo make install
 LIBVA_DRIVERS_PATH=$PWD LIBVA_DRIVER_NAME=loongvpu vainfo
 ```
 
+Nothing here has been validated on real silicon yet. See
+[`HARDWARE_VALIDATION.md`](HARDWARE_VALIDATION.md) for the staged hardware
+validation checklist (prerequisites, VCMD/buffer gates, H.264/HEVC decode
+progression, failure diagnosis, sign-off criteria).
+
 ## Roadmap
 
 Done:
