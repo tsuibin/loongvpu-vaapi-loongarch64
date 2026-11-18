@@ -17,8 +17,10 @@ A second pass re-ran the verification steps in live X11 browser sessions; see
 - Chromium 148 一般免 flag；Firefox 160 需要在 `about:config` 里强制开启。
 - 浏览器走的是 VA-API surface → DMABUF → EGL 合成器的零拷贝路径，**不需要**
   `hwdownload`。所以「ffmpeg 取帧回内存失败」不影响浏览器播放。
-- **4K60 要选 HEVC 而不是 H.264**：Firefox 实测 H.264 掉帧约 57%，HEVC 只掉
-  约 8%；Chromium 播 4K H.264 还会触发驱动缓冲 OOM 崩溃。1080p60 则两者都流畅。
+- **4K60 看码率和编码，不能一概而论**：本地 109 Mbps H.264 掉帧约 57%，
+  同内容 HEVC 约 8%；但 B 站 4K 流只有 13–22 Mbps，AVC/HEVC/AV1 三种都能
+  硬解，实测丢帧约 8–25%（码率越高越差）。Chromium 播本地高码率 H.264 会
+  触发驱动缓冲 OOM 崩溃。1080p60 则流畅。
 
 ---
 
@@ -84,12 +86,12 @@ answers `DRM_IOCTL_HANTRO_GET_VCMDSUP`. This machine only exposes
 | VP8 / VP9 | — | **no** | always software decoded |
 | JPEG | Baseline | yes | not used by `<video>` playback |
 
-YouTube and similar sites prefer VP9 or AV1. A "hardware decoder: false" result
-may simply mean the site served VP9/AV1 (unsupported here) while only
-H.264/HEVC are wired up. For **1080p**, forcing H.264 with `h264ify` /
-`enhanced-h264ify` is fine; for **4K60 do not do that** — measured browser
-performance is much worse with H.264 than with HEVC (see §6.1). If the site
-offers HEVC, prefer it; otherwise cap the resolution at 1080p60.
+YouTube and similar sites prefer VP8/VP9 (unsupported here), which explains a
+"hardware decoder: false" result. For **1080p**, forcing H.264 with `h264ify` /
+`enhanced-h264ify` is fine. For **4K**, prefer the lowest-bitrate codec the site
+offers: Bilibili serves AVC/HEVC/AV1 and its player preference is
+`setPreferCodec(0)=AV1`, `1=HEVC`, `2=AVC`; AV1 was measured best (see §6.2).
+Do not assume all H.264 4K is broken — the bad case is high bitrate (§6.2).
 
 ## 4. Prerequisites on this machine (verified)
 
@@ -266,6 +268,61 @@ Practical steps for 4K60 in Firefox:
    `MOZ_DRM_DEVICE=...`, shrinking the window (worse: ~70% dropped). CMA is
    already 256M with ~150M free, so enlarging it is not indicated.
 
+**Scope of the 57% figure:** that sample is a locally generated **~109 Mbps**
+H.264 4K60 file, not a typical streaming bitrate. See §6.2 for the bitrate
+matrix and real streaming results — H.264 4K is not universally broken here.
+
+### 6.2 Bitrate and real-world streaming (Bilibili)
+
+Controlled 4K60 H.264 files (same `testsrc2` content), Firefox with hardware
+decode forced, `getVideoPlaybackQuality()` deltas:
+
+| Actual bitrate | Dropped |
+|---:|---:|
+| 2.8 Mbps | 0% |
+| 8.0 Mbps | 0.6% |
+| 16.7 Mbps | 3.6% |
+| 29.2 Mbps | 4.1% |
+| 47.4 Mbps | 7.3% |
+| **67.9 Mbps** | **74%** |
+
+ffmpeg with `-hwaccel_output_format vaapi` still decodes the 68 Mbps file at
+95 fps (1.58x), so the cliff is in the browser display/compositing path, not
+in VPU decode.
+
+Bilibili 4K streams are all 3840×2160 and were all confirmed as VAAPI hardware
+decode (`Using preferred hardware codec …` + `IsHardwareAccelerated=true` +
+`VAAPI_VLD`). Player preference mapping: `setPreferCodec(0)=AV1` (default),
+`1=HEVC`, `2=AVC`.
+
+Three codecs on `BV1GL4y1w7f4` (same video, stable 4K windows):
+
+| Codec | Bitrate / fps | Dropped |
+|---|---|---:|
+| AV1 | 1.65 Mbps / 60.15 | **1.8–2.6%** |
+| HEVC | 2.16 Mbps / 62.5 | 4.6–9.6% |
+| AVC | 4.37 Mbps / 62.5 | 4.8–15.4% |
+
+High-bitrate 4K streams (stable windows, 3 s warm-up):
+
+| Video | Codec | Bitrate | Dropped |
+|---|---|---:|---:|
+| `BV1R1e4zKEh1` | HEVC | 21.8 Mbps | 24.4–27.1% |
+| `BV1ka4y1e78i` | AVC | 17.3 Mbps | 15.2–16.3% |
+| `BV1Wv411k7eE` | AVC | 17.2 Mbps | 13.9% |
+| `BV1UxodYQEV6` | AVC | 14.3 Mbps | 8.9–18.1% |
+| `BV1uV4y1d7K2` | HEVC | 13.6 Mbps | 8.1% |
+
+**Correction:** an earlier 57.4% figure was recorded for `BV1UxodYQEV6`. That
+sample was taken immediately after a quality switch/seek, before decode had
+stabilised. With a 3 s warm-up and a 10 s window the same video drops
+8.9–18.1%. Use the stable-window numbers above.
+
+Practical takeaway: Bilibili's current 4K streams top out around 22 Mbps and
+remain hardware-decodable with roughly 8–25% dropped frames. AV1 is both the
+lowest-bitrate and best-performing option; prefer it when available. The
+severe cliff appears only at local-file bitrates around 60+ Mbps.
+
 ## 7. Troubleshooting
 
 | Symptom | Likely cause | Action |
@@ -275,7 +332,7 @@ Practical steps for 4K60 in Firefox:
 | `CmaTotal: 0` | boot param missing | add `cma=256M` to GRUB cmdline and reboot |
 | Chromium "Video Decode: Software only" | flags / driver allowlist / AOSC platform limitation | try flags in §5, then validate with mpv/ffmpeg |
 | Firefox decode disabled | non-Intel/AMD GPU not allowlisted | `media.hardware-video-decoding.force-enabled=true` |
-| Playback uses software on VP9/AV1 sites | codec unsupported by driver | cap at 1080p; for 4K prefer HEVC — do **not** force H.264 (see §6.1) |
+| Playback uses software on VP8/VP9 sites | codec unsupported by driver | cap at 1080p; on Bilibili 4K prefer AV1/HEVC via player preference (§6.2) |
 | `hwdownload` fails with -38 | driver cannot export surfaces to system memory | expected; irrelevant to browsers, use VAAPI render path |
 | `chrome://gpu` blank in headless | ANGLE Vulkan init failure in headless mode | check in the real X11 desktop session |
 
@@ -285,11 +342,13 @@ Practical steps for 4K60 in Firefox:
   system memory, so FFmpeg filters/transcoding that need CPU-side frames fail.
 - The open scaffold in this repo is **not** hardware-validated and currently
   sees no VPU render node; it is not a browser-ready driver yet.
-- AOSC notes 4K decode performance is poor. More precisely: the VPU can do
-  4K60 decode-only at >realtime (ffmpeg with explicit VAAPI output), but in
-  browsers the codec matters — H.264 4K60 drops about half the frames and
-  crashes Chromium, while HEVC 4K60 drops only ~8% in Firefox. 1080p60 is
-  the only zero-drop browser configuration.
+- AOSC notes 4K decode performance is poor. More precisely: VPU decode-only is
+  >realtime even at 68 Mbps with explicit VAAPI output, but browser playback
+  depends on bitrate and compositing. A local 109 Mbps H.264 file dropped
+  ~57% in Firefox and crashed Chromium; a 68 Mbps local file dropped 74%.
+  Real Bilibili 4K streams (13–22 Mbps) are a different story: AVC/HEVC/AV1
+  all hardware decode with 8–25% dropped frames (§6.2). 1080p60 is the only
+  zero-drop browser configuration.
 - Full browser playback involves the GPU/compositor stack as well as VPU
   decode; a working `vainfo`/mpv result is necessary but not always sufficient.
 
@@ -314,6 +373,10 @@ Re-checked in live sessions on kernel `7.1.7-aosc-main-16k` using the closed
 | 4K60 Firefox codec (§6.1) | CDP/BiDi `getVideoPlaybackQuality()` replay delta | H.264 57.0% dropped (171/300); HEVC 7.8–8.9% dropped (14–16/180), logged as `Using preferred hardware codec hevc` + `VAAPI_VLD`; 1080p60 H.264 0% |
 | 4K60 Chromium (§6.1) | CDP playback of 4K60 H.264 | `VaapiVideoDecoder`, ~51% dropped, then `bo alloc failed: out of memory, file hantro_bufmgr.c, line 268` and GPU process `exit_code=134` (reproduced twice) |
 | 4K60 ineffective knobs (§6.1) | `force-surface-zero-copy`, compositor force, `MOZ_X11_EGL`, `MOZ_DRM_DEVICE`, small window | 57–59% dropped either way; smaller window worse (~70%) |
+| Local bitrate matrix (§6.2) | generated 4K60 H.264 files, Firefox `getVideoPlaybackQuality()` | 2.8 Mbps 0%, 8.0 0.6%, 16.7 3.6%, 29.2 4.1%, 47.4 7.3%, **67.9 74%**; ffmpeg zero-copy still 95 fps at 68 Mbps |
+| Bilibili three codecs (§6.2) | `BV1GL4y1w7f4`, `player.setPreferCodec(0/1/2)`, BiDi stats + `MOZ_LOG` | AV1 1.8–2.6%, HEVC 4.6–9.6%, AVC 4.8–15.4%; all `IsHardwareAccelerated=true`, `VAAPI_VLD` |
+| Bilibili high bitrate (§6.2) | BiDi stable-window playback of 4K streams | HEVC 21.8 Mbps 24.4–27.1%; AVC 17.3 Mbps 15.2–16.3%; AVC 14.3 Mbps 8.9–18.1%; HEVC 13.6 Mbps 8.1% |
+| Earlier 57.4% corrected (§6.2) | `BV1UxodYQEV6` retested with 3 s warm-up + 10 s window | 8.9% and 18.1% — original sample was captured during quality-switch/seek settling |
 
 Headless browser checks are not representative: headless Chromium fails ANGLE
 Vulkan initialization and headless Firefox uses SWGL with WebGL context loss.
